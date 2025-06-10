@@ -1,0 +1,98 @@
+import pandas as pd
+import numpy as np
+import os
+import re
+from datetime import datetime
+from typing import Dict, Optional
+
+
+class MultiIndexTrendingAnalyzer:
+    def __init__(self, current: pd.DataFrame, t_1: pd.DataFrame, t_7: pd.DataFrame, t_30: pd.DataFrame):
+        self.current = current
+        self.t_1 = t_1
+        self.t_7 = t_7
+        self.t_30 = t_30
+        self.actual_changes = {}
+        self.percent_changes = {}
+
+    @classmethod
+    def from_dataframes(cls, data: Dict[str, pd.DataFrame]):
+        return cls(
+            current=data['current'],
+            t_1=data['t-1'],
+            t_7=data['t-7'],
+            t_30=data['t-30']
+        )
+
+    @classmethod
+    def from_excel_directory(cls, directory: str, date_pattern=r"\d{4}-\d{2}-\d{2}"):
+        dfs = []
+        for filename in sorted(os.listdir(directory)):
+            if filename.endswith(".xlsx") and re.search(date_pattern, filename):
+                date_str = re.search(date_pattern, filename).group()
+                date = datetime.strptime(date_str, "%Y-%m-%d")
+                df = pd.read_excel(os.path.join(directory, filename))
+                df.set_index(['currency', 'type'], inplace=True)
+                dfs.append((date, df))
+
+        dfs = sorted(dfs, key=lambda x: x[0])
+        if len(dfs) < 4:
+            raise ValueError("At least 4 dated Excel files are required: t-30, t-7, t-1, current")
+
+        # Choose the last 4 snapshots for computation
+        return cls(
+            current=dfs[-1][1],
+            t_1=dfs[-2][1],
+            t_7=dfs[-3][1],
+            t_30=dfs[-4][1]
+        )
+
+    def _compute_change(self, base_df):
+        abs_change = self.current - base_df
+        pct_change = abs_change / base_df.replace(0, np.nan) * 100
+        return abs_change, pct_change
+
+    def compute_trending_stats(self):
+        abs_1, pct_1 = self._compute_change(self.t_1)
+        abs_7, pct_7 = self._compute_change(self.t_7)
+        abs_30, pct_30 = self._compute_change(self.t_30)
+
+        self.actual_changes = {'ΔDoD': abs_1, 'ΔWoW': abs_7, 'ΔMoM': abs_30}
+        self.percent_changes = {'%DoD': pct_1, '%WoW': pct_7, '%MoM': pct_30}
+
+    def get_combined_table(self) -> pd.DataFrame:
+        combined = pd.DataFrame(index=self.current.index)
+        for tenor in self.current.columns:
+            for tag in ['ΔDoD', '%DoD', 'ΔWoW', '%WoW', 'ΔMoM', '%MoM']:
+                if tag.startswith('Δ'):
+                    combined[(tenor, tag)] = self.actual_changes[tag].get(tenor)
+                else:
+                    combined[(tenor, tag)] = self.percent_changes[tag].get(tenor)
+        combined.columns = pd.MultiIndex.from_tuples(combined.columns)
+        return combined.sort_index(axis=1)
+
+    def to_excel(self, filepath: str):
+        combined = self.get_combined_table()
+
+        with pd.ExcelWriter(filepath, engine='xlsxwriter') as writer:
+            combined.to_excel(writer, sheet_name='TrendingStats')
+            workbook = writer.book
+            worksheet = writer.sheets['TrendingStats']
+
+            # Formats
+            percent_fmt = workbook.add_format({'num_format': '0.00%', 'align': 'center'})
+            abs_fmt = workbook.add_format({'num_format': '#,##0', 'align': 'center'})
+            header_fmt = workbook.add_format({'bold': True, 'bg_color': '#DDEEFF'})
+
+            worksheet.set_row(0, None, header_fmt)
+            worksheet.freeze_panes(1, 1)
+
+            for i, col in enumerate(combined.columns, start=1):
+                fmt = percent_fmt if '%' in col[1] else abs_fmt
+                worksheet.set_column(i, i, 12, fmt)
+
+    def to_html(self, output_dir='html_output'):
+        os.makedirs(output_dir, exist_ok=True)
+        combined = self.get_combined_table()
+        html_path = os.path.join(output_dir, 'trending_stats.html')
+        combined.to_html(html_path, float_format=lambda x: f"{x:.2f}%" if isinstance(x, float) and abs(x) < 1000 else f"{x:,.0f}")
