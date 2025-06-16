@@ -1,0 +1,434 @@
+import pandas as pd
+import re
+from typing import Dict, List, Optional
+
+class TripartyMapper:
+    """
+    Class to handle mapping between triparty baskets and collateral
+    """
+    
+    def __init__(self):
+        self.trade_data = None
+        self.triparty_agent_data = None
+        self.mapping_data = None
+        
+    def load_data(self, trade_df, triparty_df, mapping_df):
+        """Load the three datasets"""
+        self.trade_data = trade_df.copy()
+        self.triparty_agent_data = triparty_df.copy()
+        self.mapping_data = mapping_df.copy()
+        
+    def extract_triparty_info(self, key_column='synthetic_key'):
+        """
+        Extract trade_id and ISIN from synthetic key using regex
+        Filter for triparty transactions only
+        """
+        # Regex pattern to match MAG:xxxxxxxx.ISIN format
+        pattern = r'^MAG:(\d+)\.([A-Z]{2}[A-Z0-9]{9}[0-9])$'
+        
+        # Extract components and create new columns
+        extracted = self.mapping_data[key_column].str.extract(pattern, expand=True)
+        extracted.columns = ['trade_id', 'isin']
+        
+        # Add flag for triparty transactions
+        self.mapping_data['is_triparty'] = extracted['trade_id'].notna() & extracted['isin'].notna()
+        self.mapping_data['extracted_trade_id'] = extracted['trade_id']
+        self.mapping_data['extracted_isin'] = extracted['isin']
+        
+        # Filter for triparty transactions only
+        triparty_mapping = self.mapping_data[self.mapping_data['is_triparty']].copy()
+        
+        return triparty_mapping
+    
+    def create_basket_collateral_mapping(self):
+        """
+        Create mapping between triparty basket and collateral
+        """
+        # First extract triparty info
+        triparty_mapping = self.extract_triparty_info()
+        
+        # Merge with trade data to get basket ISIN
+        basket_mapping = pd.merge(
+            triparty_mapping,
+            self.trade_data,
+            left_on='extracted_trade_id',
+            right_on='trade_id',
+            how='inner'
+        )
+        
+        # Merge with triparty agent data to get collateral details
+        final_mapping = pd.merge(
+            basket_mapping,
+            self.triparty_agent_data,
+            left_on='extracted_isin',
+            right_on='isin',
+            how='inner',
+            suffixes=('_trade', '_collateral')
+        )
+        
+        return final_mapping
+    
+    def get_mapping_summary(self):
+        """Get summary statistics of the mapping"""
+        mapping = self.create_basket_collateral_mapping()
+        
+        summary = {
+            'total_triparty_trades': len(mapping),
+            'unique_baskets': mapping['triparty_basket_isin'].nunique() if 'triparty_basket_isin' in mapping.columns else 0,
+            'unique_collateral_isins': mapping['extracted_isin'].nunique(),
+            'total_collateral_value': mapping['mkt_value_collateral'].sum() if 'mkt_value_collateral' in mapping.columns else 0
+        }
+        
+        return summary
+
+
+class CollateralPosition:
+    """Represents a single collateral position"""
+    
+    def __init__(self, isin, market_value, interest_payment, position_type):
+        self.isin = isin
+        self.market_value = market_value
+        self.interest_payment = interest_payment
+        self.position_type = position_type  # 'given' or 'received'
+    
+    def __repr__(self):
+        return f"CollateralPosition(isin='{self.isin}', value={self.market_value}, type='{self.position_type}')"
+
+
+class TripartyParticipant:
+    """Represents a participant in triparty transaction"""
+    
+    def __init__(self, participant_id, account_id, role):
+        self.participant_id = participant_id
+        self.account_id = account_id
+        self.role = role  # 'taker' or 'giver'
+        self.children = []  # For parent-child relationships
+        self.parent = None
+    
+    def add_child(self, child_participant):
+        """Add a child participant (for hierarchical structures)"""
+        self.children.append(child_participant)
+        child_participant.parent = self
+    
+    def get_all_children(self):
+        """Get all children recursively"""
+        all_children = []
+        for child in self.children:
+            all_children.append(child)
+            all_children.extend(child.get_all_children())
+        return all_children
+    
+    def __repr__(self):
+        return f"TripartyParticipant(id='{self.participant_id}', role='{self.role}', children={len(self.children)})"
+
+
+class TripartyTransaction:
+    """
+    Class to represent the complete triparty structure
+    """
+    
+    def __init__(self, trade_id, basket_isin):
+        self.trade_id = trade_id
+        self.basket_isin = basket_isin
+        self.collateral_taker = None
+        self.collateral_giver = None
+        self.triparty_agent = None
+        self.collateral_positions = []
+        self.account_isin_mapping = {}
+        
+    def add_participant(self, participant):
+        """Add a participant to the transaction"""
+        if participant.role == 'taker':
+            self.collateral_taker = participant
+        elif participant.role == 'giver':
+            self.collateral_giver = participant
+            
+    def add_collateral_position(self, position):
+        """Add a collateral position"""
+        self.collateral_positions.append(position)
+        
+    def set_triparty_agent(self, agent_id):
+        """Set the triparty agent"""
+        self.triparty_agent = agent_id
+        
+    def add_account_isin_mapping(self, account_id, isin):
+        """Add mapping between account and ISIN"""
+        self.account_isin_mapping[account_id] = isin
+        
+    def get_total_collateral_value(self):
+        """Calculate total market value of all collateral"""
+        return sum(pos.market_value for pos in self.collateral_positions)
+        
+    def get_total_interest_payments(self):
+        """Calculate total interest payments"""
+        return sum(pos.interest_payment for pos in self.collateral_positions)
+        
+    def get_collateral_by_type(self, position_type):
+        """Get collateral positions by type (given/received)"""
+        return [pos for pos in self.collateral_positions if pos.position_type == position_type]
+    
+    def get_participant_hierarchy(self):
+        """Get the hierarchical structure of participants"""
+        hierarchy = {}
+        
+        if self.collateral_taker:
+            hierarchy['taker'] = {
+                'participant': self.collateral_taker,
+                'children': self.collateral_taker.get_all_children()
+            }
+            
+        if self.collateral_giver:
+            hierarchy['giver'] = {
+                'participant': self.collateral_giver,
+                'children': self.collateral_giver.get_all_children()
+            }
+            
+        return hierarchy
+        
+    def get_transaction_summary(self):
+        """Get summary of the transaction"""
+        return {
+            'trade_id': self.trade_id,
+            'basket_isin': self.basket_isin,
+            'triparty_agent': self.triparty_agent,
+            'collateral_taker': self.collateral_taker.participant_id if self.collateral_taker else None,
+            'collateral_giver': self.collateral_giver.participant_id if self.collateral_giver else None,
+            'total_collateral_positions': len(self.collateral_positions),
+            'total_market_value': self.get_total_collateral_value(),
+            'total_interest_payments': self.get_total_interest_payments(),
+            'collateral_given_count': len(self.get_collateral_by_type('given')),
+            'collateral_received_count': len(self.get_collateral_by_type('received')),
+            'participant_hierarchy': self.get_participant_hierarchy()
+        }
+    
+    def __repr__(self):
+        return f"TripartyTransaction(trade_id='{self.trade_id}', positions={len(self.collateral_positions)})"
+
+
+class TripartyPortfolio:
+    """
+    Class to manage multiple triparty transactions
+    """
+    
+    def __init__(self):
+        self.transactions = {}
+        
+    def add_transaction(self, transaction):
+        """Add a transaction to the portfolio"""
+        self.transactions[transaction.trade_id] = transaction
+        
+    def get_transaction(self, trade_id):
+        """Get a specific transaction"""
+        return self.transactions.get(trade_id)
+        
+    def get_portfolio_summary(self):
+        """Get summary of entire portfolio"""
+        total_value = sum(txn.get_total_collateral_value() for txn in self.transactions.values())
+        total_interest = sum(txn.get_total_interest_payments() for txn in self.transactions.values())
+        
+        return {
+            'total_transactions': len(self.transactions),
+            'total_portfolio_value': total_value,
+            'total_interest_payments': total_interest,
+            'unique_baskets': len(set(txn.basket_isin for txn in self.transactions.values())),
+            'transactions_by_agent': self._group_by_agent()
+        }
+        
+    def _group_by_agent(self):
+        """Group transactions by triparty agent"""
+        agent_counts = {}
+        for txn in self.transactions.values():
+            agent = txn.triparty_agent or 'Unknown'
+            agent_counts[agent] = agent_counts.get(agent, 0) + 1
+        return agent_counts
+
+
+# Sample data creation and examples
+def create_sample_data():
+    """Create sample dataframes for demonstration"""
+    
+    # Sample Trade Data
+    trade_data = pd.DataFrame({
+        'trade_id': ['12345678', '12345679', '12345680', '12345681'],
+        'triparty_basket_isin': ['US1234567890', 'DE0001234567', 'FR0001234567', 'GB0001234567'],
+        'trade_date': ['2023-01-15', '2023-01-16', '2023-01-17', '2023-01-18'],
+        'nominal_amount': [1000000, 2000000, 1500000, 3000000]
+    })
+    
+    # Sample Triparty Agent Data
+    triparty_agent_data = pd.DataFrame({
+        'isin': ['US9876543210', 'DE0009876543', 'FR0009876543', 'GB0009876543', 'JP0009876543'],
+        'account_id': ['ACC_001', 'ACC_002', 'ACC_003', 'ACC_004', 'ACC_005'],
+        'collateral_taker': ['BANK_A', 'BANK_B', 'BANK_A', 'BANK_C', 'BANK_B'],
+        'collateral_giver': ['BANK_X', 'BANK_Y', 'BANK_Z', 'BANK_X', 'BANK_Y'],
+        'mkt_value_collateral': [950000, 1800000, 1400000, 2900000, 800000],
+        'interest_payments': [4750, 9000, 7000, 14500, 4000]
+    })
+    
+    # Sample Mapping Data (with synthetic keys)
+    mapping_data = pd.DataFrame({
+        'synthetic_key': [
+            'MAG:12345678.US9876543210',  # Valid triparty key
+            'MAG:12345679.DE0009876543',  # Valid triparty key
+            'MAG:12345680.FR0009876543',  # Valid triparty key
+            'MAG:12345681',               # Invalid - no ISIN
+            'MAG:12345682.GB0009876543',  # Valid but no matching trade
+            'MAG:12345679.JP0009876543'   # Valid triparty key
+        ]
+    })
+    
+    return trade_data, triparty_agent_data, mapping_data
+
+
+def demonstrate_mapping():
+    """Demonstrate the mapping functionality"""
+    print("=== Creating Sample Data ===")
+    trade_df, triparty_df, mapping_df = create_sample_data()
+    
+    print("\nTrade Data:")
+    print(trade_df)
+    
+    print("\nTriparty Agent Data:")
+    print(triparty_df)
+    
+    print("\nMapping Data:")
+    print(mapping_df)
+    
+    print("\n=== Running Triparty Mapping ===")
+    mapper = TripartyMapper()
+    mapper.load_data(trade_df, triparty_df, mapping_df)
+    
+    # Extract triparty info
+    triparty_mapping = mapper.extract_triparty_info()
+    print("\nTriparty Mapping (after regex extraction):")
+    print(triparty_mapping)
+    
+    # Create complete mapping
+    complete_mapping = mapper.create_basket_collateral_mapping()
+    print("\nComplete Basket-Collateral Mapping:")
+    print(complete_mapping[['trade_id', 'triparty_basket_isin', 'extracted_isin', 'mkt_value_collateral', 'collateral_taker', 'collateral_giver']])
+    
+    # Get summary
+    summary = mapper.get_mapping_summary()
+    print("\nMapping Summary:")
+    for key, value in summary.items():
+        print(f"  {key}: {value}")
+
+
+def demonstrate_triparty_structure():
+    """Demonstrate the triparty transaction structure with parent-child relationships"""
+    print("\n=== Creating Triparty Transaction Structure ===")
+    
+    # Create main transaction
+    txn = TripartyTransaction('12345678', 'US1234567890')
+    txn.set_triparty_agent('TRIPARTY_AGENT_ABC')
+    
+    # Create main participants (parents)
+    main_taker = TripartyParticipant('BANK_A', 'ACC_001', 'taker')
+    main_giver = TripartyParticipant('BANK_X', 'ACC_006', 'giver')
+    
+    # Create child participants (subsidiaries/sub-accounts)
+    taker_subsidiary1 = TripartyParticipant('BANK_A_SUB1', 'ACC_001_SUB1', 'taker')
+    taker_subsidiary2 = TripartyParticipant('BANK_A_SUB2', 'ACC_001_SUB2', 'taker')
+    giver_subsidiary1 = TripartyParticipant('BANK_X_SUB1', 'ACC_006_SUB1', 'giver')
+    
+    # Build parent-child relationships
+    main_taker.add_child(taker_subsidiary1)
+    main_taker.add_child(taker_subsidiary2)
+    main_giver.add_child(giver_subsidiary1)
+    
+    # Add participants to transaction
+    txn.add_participant(main_taker)
+    txn.add_participant(main_giver)
+    
+    # Add collateral positions
+    collateral1 = CollateralPosition('US9876543210', 950000.0, 4750.0, 'given')
+    collateral2 = CollateralPosition('DE0009876543', 1800000.0, 9000.0, 'received')
+    collateral3 = CollateralPosition('FR0009876543', 1400000.0, 7000.0, 'given')
+    
+    txn.add_collateral_position(collateral1)
+    txn.add_collateral_position(collateral2)
+    txn.add_collateral_position(collateral3)
+    
+    # Add account-ISIN mappings
+    txn.add_account_isin_mapping('ACC_001', 'US1234567890')
+    txn.add_account_isin_mapping('ACC_006', 'US1234567890')
+    
+    print("Transaction created:", txn)
+    
+    # Display participant hierarchy
+    hierarchy = txn.get_participant_hierarchy()
+    print("\n=== Participant Hierarchy ===")
+    
+    for role, info in hierarchy.items():
+        participant = info['participant']
+        children = info['children']
+        
+        print(f"\n{role.upper()}:")
+        print(f"  Main: {participant.participant_id} (Account: {participant.account_id})")
+        
+        if children:
+            print("  Children:")
+            for child in children:
+                print(f"    - {child.participant_id} (Account: {child.account_id})")
+        else:
+            print("  Children: None")
+    
+    # Get transaction summary
+    summary = txn.get_transaction_summary()
+    print("\n=== Transaction Summary ===")
+    for key, value in summary.items():
+        if key != 'participant_hierarchy':  # Skip hierarchy in summary print
+            print(f"  {key}: {value}")
+    
+    # Show collateral breakdown
+    print("\n=== Collateral Breakdown ===")
+    print("Given Collateral:")
+    for pos in txn.get_collateral_by_type('given'):
+        print(f"  {pos}")
+    
+    print("Received Collateral:")
+    for pos in txn.get_collateral_by_type('received'):
+        print(f"  {pos}")
+    
+    return txn
+
+
+def demonstrate_portfolio():
+    """Demonstrate portfolio management"""
+    print("\n=== Creating Portfolio ===")
+    
+    portfolio = TripartyPortfolio()
+    
+    # Create multiple transactions
+    txn1 = demonstrate_triparty_structure()
+    
+    # Create second transaction
+    txn2 = TripartyTransaction('12345679', 'DE0001234567')
+    txn2.set_triparty_agent('TRIPARTY_AGENT_XYZ')
+    
+    simple_taker = TripartyParticipant('BANK_B', 'ACC_002', 'taker')
+    simple_giver = TripartyParticipant('BANK_Y', 'ACC_007', 'giver')
+    
+    txn2.add_participant(simple_taker)
+    txn2.add_participant(simple_giver)
+    
+    collateral = CollateralPosition('DE0009876543', 1800000.0, 9000.0, 'given')
+    txn2.add_collateral_position(collateral)
+    
+    # Add to portfolio
+    portfolio.add_transaction(txn1)
+    portfolio.add_transaction(txn2)
+    
+    # Get portfolio summary
+    portfolio_summary = portfolio.get_portfolio_summary()
+    print("\n=== Portfolio Summary ===")
+    for key, value in portfolio_summary.items():
+        print(f"  {key}: {value}")
+
+
+if __name__ == "__main__":
+    # Run all demonstrations
+    demonstrate_mapping()
+    demonstrate_triparty_structure()
+    demonstrate_portfolio()

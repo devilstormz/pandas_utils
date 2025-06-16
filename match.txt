@@ -1,0 +1,342 @@
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Tuple, Set, Optional
+
+def extract_base_trade_id(trade_id: str, suffix: str = "_CA") -> str:
+    """
+    Extract the base trade ID by removing the suffix if present.
+    
+    Parameters:
+    -----------
+    trade_id : str
+        The trade ID to process
+    suffix : str
+        The suffix to remove (default: "_CA")
+    
+    Returns:
+    --------
+    str: Base trade ID
+    """
+    if trade_id.endswith(suffix):
+        return trade_id[:-len(suffix)]
+    return trade_id
+
+def identify_trade_pairs(trades_df: pd.DataFrame, 
+                        trade_id_col: str = 'trade_id',
+                        trade_type_col: str = 'trade_type',
+                        suffix: str = "_CA") -> pd.DataFrame:
+    """
+    Identify and pair trades based on trade ID patterns and repo/reverse repo types.
+    
+    Parameters:
+    -----------
+    trades_df : pd.DataFrame
+        DataFrame containing trade data
+    trade_id_col : str
+        Column name for trade IDs
+    trade_type_col : str  
+        Column name for trade types (should contain 'repo', 'reverse repo', etc.)
+    suffix : str
+        Suffix pattern to match (default: "_CA")
+    
+    Returns:
+    --------
+    pd.DataFrame
+        Enhanced dataframe with pairing information
+    """
+    
+    df = trades_df.copy()
+    
+    # Normalize trade types for consistent matching
+    df['normalized_trade_type'] = df[trade_type_col].str.lower().str.strip()
+    
+    # Extract base trade ID
+    df['base_trade_id'] = df[trade_id_col].apply(lambda x: extract_base_trade_id(x, suffix))
+    
+    # Identify if trade has the suffix
+    df['has_suffix'] = df[trade_id_col].str.endswith(suffix)
+    
+    # Initialize pairing columns
+    df['pair_status'] = 'unpaired'
+    df['pair_id'] = None
+    df['paired_trade_id'] = None
+    df['pairing_type'] = None
+    df['is_repo_reverse_pair'] = False
+    
+    # Group by base trade ID to find potential pairs
+    pair_counter = 1
+    
+    for base_id, group in df.groupby('base_trade_id'):
+        group_trades = group.copy()
+        
+        # Separate trades with and without suffix
+        suffix_trades = group_trades[group_trades['has_suffix'] == True]
+        no_suffix_trades = group_trades[group_trades['has_suffix'] == False]
+        
+        # Case 1: Perfect pairs (one with suffix, one without)
+        if len(suffix_trades) > 0 and len(no_suffix_trades) > 0:
+            for _, suffix_trade in suffix_trades.iterrows():
+                for _, no_suffix_trade in no_suffix_trades.iterrows():
+                    
+                    # Check if they form a repo/reverse repo pair
+                    suffix_type = suffix_trade['normalized_trade_type']
+                    no_suffix_type = no_suffix_trade['normalized_trade_type']
+                    
+                    is_repo_pair = _is_repo_reverse_pair(suffix_type, no_suffix_type)
+                    
+                    if is_repo_pair:
+                        pair_id = f"PAIR_{pair_counter:04d}"
+                        
+                        # Update suffix trade
+                        df.loc[suffix_trade.name, 'pair_status'] = 'paired'
+                        df.loc[suffix_trade.name, 'pair_id'] = pair_id
+                        df.loc[suffix_trade.name, 'paired_trade_id'] = no_suffix_trade[trade_id_col]
+                        df.loc[suffix_trade.name, 'pairing_type'] = 'perfect_pair'
+                        df.loc[suffix_trade.name, 'is_repo_reverse_pair'] = True
+                        
+                        # Update no-suffix trade
+                        df.loc[no_suffix_trade.name, 'pair_status'] = 'paired'
+                        df.loc[no_suffix_trade.name, 'pair_id'] = pair_id
+                        df.loc[no_suffix_trade.name, 'paired_trade_id'] = suffix_trade[trade_id_col]
+                        df.loc[no_suffix_trade.name, 'pairing_type'] = 'perfect_pair'
+                        df.loc[no_suffix_trade.name, 'is_repo_reverse_pair'] = True
+                        
+                        pair_counter += 1
+                        break
+        
+        # Case 2: Mark orphaned suffix trades (suffix trades without matching base)
+        unpaired_suffix_trades = group_trades[(group_trades['has_suffix'] == True) & 
+                                            (group_trades['pair_status'] == 'unpaired')]
+        
+        for _, orphan_trade in unpaired_suffix_trades.iterrows():
+            df.loc[orphan_trade.name, 'pair_status'] = 'orphaned_suffix'
+            df.loc[orphan_trade.name, 'pairing_type'] = 'orphaned_suffix'
+        
+        # Case 3: Mark orphaned base trades (base trades without matching suffix)
+        unpaired_base_trades = group_trades[(group_trades['has_suffix'] == False) & 
+                                          (group_trades['pair_status'] == 'unpaired')]
+        
+        for _, orphan_trade in unpaired_base_trades.iterrows():
+            df.loc[orphan_trade.name, 'pair_status'] = 'orphaned_base'
+            df.loc[orphan_trade.name, 'pairing_type'] = 'orphaned_base'
+    
+    return df
+
+def _is_repo_reverse_pair(type1: str, type2: str) -> bool:
+    """
+    Check if two trade types form a repo/reverse repo pair.
+    
+    Parameters:
+    -----------
+    type1, type2 : str
+        Normalized trade types to compare
+    
+    Returns:
+    --------
+    bool: True if they form a repo/reverse repo pair
+    """
+    
+    repo_keywords = ['repo', 'repurchase']
+    reverse_repo_keywords = ['reverse repo', 'reverse repurchase', 'rev repo']
+    
+    # Check if one is repo and other is reverse repo
+    type1_is_repo = any(keyword in type1 for keyword in repo_keywords) and not any(keyword in type1 for keyword in reverse_repo_keywords)
+    type1_is_reverse = any(keyword in type1 for keyword in reverse_repo_keywords)
+    
+    type2_is_repo = any(keyword in type2 for keyword in repo_keywords) and not any(keyword in type2 for keyword in reverse_repo_keywords)
+    type2_is_reverse = any(keyword in type2 for keyword in reverse_repo_keywords)
+    
+    return (type1_is_repo and type2_is_reverse) or (type1_is_reverse and type2_is_repo)
+
+def analyze_pairing_results(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create a summary analysis of the pairing results.
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        DataFrame with pairing results
+    
+    Returns:
+    --------
+    pd.DataFrame: Summary statistics
+    """
+    
+    summary_data = []
+    
+    # Overall statistics
+    total_trades = len(df)
+    paired_trades = len(df[df['pair_status'] == 'paired'])
+    orphaned_suffix = len(df[df['pair_status'] == 'orphaned_suffix'])
+    orphaned_base = len(df[df['pair_status'] == 'orphaned_base'])
+    unpaired = len(df[df['pair_status'] == 'unpaired'])
+    
+    summary_data.append({
+        'metric': 'Total Trades',
+        'count': total_trades,
+        'percentage': 100.0
+    })
+    
+    summary_data.append({
+        'metric': 'Successfully Paired',
+        'count': paired_trades,
+        'percentage': (paired_trades / total_trades * 100) if total_trades > 0 else 0
+    })
+    
+    summary_data.append({
+        'metric': 'Orphaned Suffix Trades',
+        'count': orphaned_suffix,
+        'percentage': (orphaned_suffix / total_trades * 100) if total_trades > 0 else 0
+    })
+    
+    summary_data.append({
+        'metric': 'Orphaned Base Trades', 
+        'count': orphaned_base,
+        'percentage': (orphaned_base / total_trades * 100) if total_trades > 0 else 0
+    })
+    
+    summary_data.append({
+        'metric': 'Other Unpaired',
+        'count': unpaired,
+        'percentage': (unpaired / total_trades * 100) if total_trades > 0 else 0
+    })
+    
+    # Unique pairs count
+    unique_pairs = df[df['pair_id'].notna()]['pair_id'].nunique()
+    summary_data.append({
+        'metric': 'Unique Pairs Created',
+        'count': unique_pairs,
+        'percentage': None
+    })
+    
+    return pd.DataFrame(summary_data)
+
+def get_orphaned_trades(df: pd.DataFrame, orphan_type: str = 'suffix') -> pd.DataFrame:
+    """
+    Get detailed information about orphaned trades.
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        DataFrame with pairing results
+    orphan_type : str
+        'suffix' for orphaned suffix trades, 'base' for orphaned base trades, 'all' for both
+    
+    Returns:
+    --------
+    pd.DataFrame: Orphaned trades information
+    """
+    
+    if orphan_type == 'suffix':
+        return df[df['pair_status'] == 'orphaned_suffix'].copy()
+    elif orphan_type == 'base':
+        return df[df['pair_status'] == 'orphaned_base'].copy()
+    elif orphan_type == 'all':
+        return df[df['pair_status'].isin(['orphaned_suffix', 'orphaned_base'])].copy()
+    else:
+        raise ValueError("orphan_type must be 'suffix', 'base', or 'all'")
+
+def get_paired_trades(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Get detailed information about successfully paired trades.
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        DataFrame with pairing results
+    
+    Returns:
+    --------
+    pd.DataFrame: Paired trades with their counterparts
+    """
+    
+    paired_df = df[df['pair_status'] == 'paired'].copy()
+    
+    if paired_df.empty:
+        return paired_df
+    
+    # Sort by pair_id for easier viewing
+    paired_df = paired_df.sort_values('pair_id')
+    
+    return paired_df
+
+# Example usage and test data
+def create_sample_data():
+    """Create sample data for testing the pairing logic"""
+    
+    trades_data = {
+        'trade_id': [
+            '1234', '1234_CA',           # Perfect pair (2 trades)
+            '5678', '5678_CA',           # Perfect pair (2 trades)
+            '9999_CA',                   # Orphaned suffix (1 trade)
+            '1111',                      # Orphaned base (1 trade)
+            '2222', '2222_CA',           # Perfect pair (2 trades)
+            '3333_CA',                   # Orphaned suffix (1 trade)
+            '4444'                       # Orphaned base (1 trade)
+        ],
+        'trade_type': [
+            'repo', 'reverse repo',      # Perfect repo/reverse pair
+            'reverse repo', 'repo',      # Perfect repo/reverse pair
+            'repo',                      # Orphaned
+            'reverse repo',              # Orphaned  
+            'repo', 'reverse repo',      # Perfect pair
+            'reverse repo',              # Orphaned
+            'repo'                       # Orphaned
+        ],
+        'amount': [
+            1000000, -1000000,           # Pair 1
+            500000, -500000,             # Pair 2
+            750000,                      # Orphaned
+            300000,                      # Orphaned
+            200000, -200000,             # Pair 3
+            150000,                      # Orphaned
+            100000                       # Orphaned
+        ],
+        'book': [
+            'BOOK_A', 'BOOK_B',          # Pair 1
+            'BOOK_C', 'BOOK_D',          # Pair 2
+            'BOOK_E',                    # Orphaned
+            'BOOK_F',                    # Orphaned
+            'BOOK_G', 'BOOK_H',          # Pair 3
+            'BOOK_I',                    # Orphaned
+            'BOOK_J'                     # Orphaned
+        ]
+    }
+    
+    return pd.DataFrame(trades_data)
+
+# Example execution
+if __name__ == "__main__":
+    # Create sample data
+    trades_df = create_sample_data()
+    
+    print("Original Trades Data:")
+    print(trades_df[['trade_id', 'trade_type', 'amount']])
+    print("\n" + "="*80 + "\n")
+    
+    # Identify trade pairs
+    paired_trades = identify_trade_pairs(trades_df)
+    
+    print("Pairing Analysis Results:")
+    print(paired_trades[['trade_id', 'trade_type', 'base_trade_id', 'has_suffix', 
+                        'pair_status', 'pair_id', 'paired_trade_id', 'is_repo_reverse_pair']])
+    print("\n" + "="*80 + "\n")
+    
+    # Generate summary
+    summary = analyze_pairing_results(paired_trades)
+    print("Pairing Summary:")
+    print(summary)
+    print("\n" + "="*80 + "\n")
+    
+    # Show successfully paired trades
+    successful_pairs = get_paired_trades(paired_trades)
+    if not successful_pairs.empty:
+        print("Successfully Paired Trades:")
+        print(successful_pairs[['trade_id', 'trade_type', 'pair_id', 'paired_trade_id']])
+        print("\n" + "="*40 + "\n")
+    
+    # Show orphaned trades
+    orphaned = get_orphaned_trades(paired_trades, 'all')
+    if not orphaned.empty:
+        print("Orphaned Trades:")
+        print(orphaned[['trade_id', 'trade_type', 'pair_status']])
