@@ -1,0 +1,661 @@
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Set, Tuple, Optional
+import re
+from datetime import datetime, timedelta
+import random
+
+class InternalTradeMatchingEngine:
+    """
+    A class to identify and classify internal trades based on booking patterns and counterparty relationships.
+    
+    Trade Types:
+    1. Inter desk books: Matched pairs (repo/reverse repo, bond borrow/lend) with IDs like 123 and 123_CA
+    2. Other desk to our desk books: Unmatched trades (123 or 123_CA) from other desks to our books
+    3. Our desk books to other desk: Unmatched trades (123 or 123_CA) from our books to other desks
+    """
+    
+    def __init__(self, external_books: List[str]):
+        """
+        Initialize the matching engine with external book IDs.
+        
+        Args:
+            external_books: List of the 2 external (non-internal) book IDs
+        """
+        self.external_books = set(external_books)
+        self.desk_book_mapping = {}  # Will be populated by API call
+        self.all_internal_books = set()
+        self.our_desk_books = set()
+        
+        # Initialize with dummy data - replace with actual API call
+        self._initialize_desk_mappings()
+    
+    def _get_books_for_desk(self, desk_id: str) -> List[str]:
+        """
+        Dummy API call to get books for a specific desk.
+        Replace this method with your actual API call.
+        
+        Args:
+            desk_id: The desk identifier
+            
+        Returns:
+            List of book IDs for the specified desk
+        """
+        # Dummy data - replace with actual API call
+        dummy_desk_mappings = {
+            'TRADING_DESK': ['BK001', 'BK002', 'BK003', 'BK004'],
+            'PRIME_DESK': ['BK005', 'BK006', 'BK007'],
+            'REPO_DESK': ['BK008', 'BK009', 'BK010', 'BK011', 'BK012'],
+            'EQUITY_DESK': ['BK013', 'BK014', 'BK015'],
+            'FX_DESK': ['BK016', 'BK017']
+        }
+        
+        return dummy_desk_mappings.get(desk_id, [])
+    
+    def _initialize_desk_mappings(self):
+        """Initialize desk mappings using API calls."""
+        # Define which desk is "our desk" - replace with your logic
+        our_desk_id = 'TRADING_DESK'
+        
+        # Get all desk IDs - replace with your actual desk list
+        all_desk_ids = ['TRADING_DESK', 'PRIME_DESK', 'REPO_DESK', 'EQUITY_DESK', 'FX_DESK']
+        
+        # Populate desk mappings
+        for desk_id in all_desk_ids:
+            books = self._get_books_for_desk(desk_id)
+            self.desk_book_mapping[desk_id] = books
+            self.all_internal_books.update(books)
+        
+        # Set our desk books
+        self.our_desk_books = set(self.desk_book_mapping[our_desk_id])
+    
+    def _extract_base_trade_id(self, trade_id: str) -> str:
+        """Extract base trade ID by removing _CA suffix if present."""
+        return trade_id.replace('_CA', '') if trade_id.endswith('_CA') else trade_id
+    
+    def _is_ca_trade(self, trade_id: str) -> bool:
+        """Check if trade ID has _CA suffix."""
+        return trade_id.endswith('_CA')
+    
+    def _find_matching_trades(self, df: pd.DataFrame) -> Dict[str, List[int]]:
+        """
+        Find trades that have matching base IDs (e.g., 123 and 123_CA).
+        Handles scenarios where groupby leads to multiple rows.
+        
+        Returns:
+            Dictionary mapping base trade IDs to list of row indices that match
+        """
+        base_id_groups = {}
+        
+        for idx, row in df.iterrows():
+            base_id = self._extract_base_trade_id(row['trade_id'])
+            if base_id not in base_id_groups:
+                base_id_groups[base_id] = []
+            base_id_groups[base_id].append(idx)
+        
+        # Return all groups (including single trades for unmatched classification)
+        return base_id_groups
+    
+    def _validate_inter_desk_match_simple(self, trades_group: pd.DataFrame) -> bool:
+        """
+        Simple validation for inter-desk matches.
+        Assumes there are either 1 or 2 trades in the group.
+        
+        Returns:
+            Boolean indicating if the group represents a valid match
+        """
+        if len(trades_group) == 1:
+            return False
+        elif len(trades_group) == 2:
+            trade1, trade2 = trades_group.iloc[0], trades_group.iloc[1]
+            return self._is_valid_pair(trade1, trade2)
+        else:
+            # More than 2 trades - not handled in simple approach
+            return False
+    
+    def _validate_inter_desk_match(self, trades_group: pd.DataFrame) -> Tuple[bool, List[Tuple[int, int]]]:
+        """
+        Complex validation for inter-desk matches.
+        Handles multiple rows by finding valid pairs.
+        
+        Returns:
+            Tuple of (has_valid_matches, list_of_matched_pairs_indices)
+        """
+        if len(trades_group) < 2:
+            return False, []
+        
+        valid_pairs = []
+        used_indices = set()
+        
+        trades_list = list(trades_group.iterrows())
+        
+        # Try to find valid pairs
+        for i, (idx1, trade1) in enumerate(trades_list):
+            if idx1 in used_indices:
+                continue
+                
+            for j, (idx2, trade2) in enumerate(trades_list[i+1:], i+1):
+                if idx2 in used_indices:
+                    continue
+                
+                # Check if this pair is valid
+                if self._is_valid_pair(trade1, trade2):
+                    valid_pairs.append((idx1, idx2))
+                    used_indices.add(idx1)
+                    used_indices.add(idx2)
+                    break
+        
+        return len(valid_pairs) > 0, valid_pairs
+    
+    def _is_valid_pair(self, trade1: pd.Series, trade2: pd.Series) -> bool:
+        """Check if two trades form a valid inter-desk pair."""
+        # Check if both trades are from our desk books
+        if not (trade1['book'] in self.our_desk_books and trade2['book'] in self.our_desk_books):
+            return False
+        
+        # Check if counterparties match the other trade's book
+        if not (trade1['counterparty'] == trade2['book'] and trade2['counterparty'] == trade1['book']):
+            return False
+        
+        # Check same underlying security
+        security_fields = ['isin', 'cusip', 'ticker']
+        for field in security_fields:
+            if field in trade1.index and field in trade2.index:
+                if pd.notna(trade1[field]) and pd.notna(trade2[field]):
+                    if trade1[field] != trade2[field]:
+                        return False
+        
+        # Check same maturity and notional
+        if trade1['maturity'] != trade2['maturity'] or abs(trade1['notional']) != abs(trade2['notional']):
+            return False
+        
+        # Check for complementary positions
+        if 'trade_type' in trade1.index:
+            complementary_types = [
+                ('repo', 'reverse_repo'),
+                ('reverse_repo', 'repo'),
+                ('bond_borrow', 'bond_lend'),
+                ('bond_lend', 'bond_borrow')
+            ]
+            trade_types = (trade1['trade_type'].lower(), trade2['trade_type'].lower())
+            if trade_types not in complementary_types:
+                return False
+        else:
+            # Check for opposite notional signs
+            if np.sign(trade1['notional']) == np.sign(trade2['notional']):
+                return False
+        
+        return True
+    
+    def _classify_unmatched_trade(self, trade: pd.Series) -> str:
+        """
+        Classify an unmatched trade as type 2 or 3.
+        
+        Type 2: Other desk to our desk books
+        Type 3: Our desk books to other desk
+        """
+        if trade['book'] in self.our_desk_books:
+            return 'type_3_our_to_other'
+        elif trade['book'] in self.all_internal_books:
+            return 'type_2_other_to_our'
+        else:
+            return 'external_trade'
+    
+    def process_trades_simple(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Simple approach to process trades - assumes groups have either 1 or 2 trades.
+        
+        Args:
+            df: DataFrame with trade data
+        
+        Returns:
+            Tuple of (processed_dataframe, debug_dataframe)
+        """
+        # Create a copy to avoid modifying the original dataframe
+        result_df = df.copy()
+        
+        # Initialize new columns
+        result_df['internal_trade_type'] = None
+        result_df['match_group_id'] = None
+        result_df['is_matched'] = False
+        result_df['match_pair_id'] = None
+        
+        # Filter for internal trades only
+        internal_trades = result_df[
+            (result_df['isInternal'] == True) & 
+            (result_df['book'].isin(self.all_internal_books))
+        ].copy()
+        
+        if internal_trades.empty:
+            debug_df = result_df.copy()
+            debug_df['debug_status'] = 'no_internal_trades'
+            debug_df['matching_approach'] = 'simple'
+            return result_df, debug_df
+        
+        # Find potential matching trades
+        matching_groups = self._find_matching_trades(internal_trades)
+        
+        processed_indices = set()
+        match_pair_counter = 1
+        
+        # Process matching groups with simple approach
+        for base_id, indices in matching_groups.items():
+            if len(indices) == 1:
+                # Single trade - classify as unmatched
+                idx = indices[0]
+                trade = internal_trades.loc[idx]
+                trade_type = self._classify_unmatched_trade(trade)
+                result_df.loc[idx, 'internal_trade_type'] = trade_type
+                result_df.loc[idx, 'match_group_id'] = base_id
+                result_df.loc[idx, 'is_matched'] = False
+                processed_indices.add(idx)
+                
+            elif len(indices) == 2:
+                # Two trades - check if they form a valid pair
+                trades_group = internal_trades.loc[indices]
+                
+                if self._validate_inter_desk_match_simple(trades_group):
+                    # Mark as matched pair (Type 1)
+                    pair_id = f"PAIR_{match_pair_counter}"
+                    for idx in indices:
+                        result_df.loc[idx, 'internal_trade_type'] = 'type_1_inter_desk'
+                        result_df.loc[idx, 'match_group_id'] = base_id
+                        result_df.loc[idx, 'is_matched'] = True
+                        result_df.loc[idx, 'match_pair_id'] = pair_id
+                        processed_indices.add(idx)
+                    match_pair_counter += 1
+                else:
+                    # Not a valid pair - classify individually as unmatched
+                    for idx in indices:
+                        trade = internal_trades.loc[idx]
+                        trade_type = self._classify_unmatched_trade(trade)
+                        result_df.loc[idx, 'internal_trade_type'] = trade_type
+                        result_df.loc[idx, 'match_group_id'] = base_id
+                        result_df.loc[idx, 'is_matched'] = False
+                        processed_indices.add(idx)
+            else:
+                # More than 2 trades - simple approach can't handle, classify all as unmatched
+                for idx in indices:
+                    trade = internal_trades.loc[idx]
+                    trade_type = self._classify_unmatched_trade(trade)
+                    result_df.loc[idx, 'internal_trade_type'] = trade_type
+                    result_df.loc[idx, 'match_group_id'] = base_id
+                    result_df.loc[idx, 'is_matched'] = False
+                    processed_indices.add(idx)
+        
+        # Create debug dataframe
+        debug_df = result_df.copy()
+        debug_df['original_index'] = debug_df.index
+        debug_df['matching_approach'] = 'simple'
+        debug_df['desk_classification'] = debug_df['book'].apply(
+            lambda x: 'our_desk' if x in self.our_desk_books 
+            else 'other_internal_desk' if x in self.all_internal_books 
+            else 'external'
+        )
+        
+        return result_df, debug_df
+
+    def process_trades(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Process the trades dataframe and classify internal trades.
+        
+        Args:
+            df: DataFrame with trade data
+        
+        Returns:
+            Tuple of (processed_dataframe, debug_dataframe)
+        """
+        # Create a copy to avoid modifying the original dataframe
+        result_df = df.copy()
+        
+        # Initialize new columns
+        result_df['internal_trade_type'] = None
+        result_df['match_group_id'] = None
+        result_df['is_matched'] = False
+        result_df['match_pair_id'] = None
+        
+        # Filter for internal trades only
+        internal_trades = result_df[
+            (result_df['isInternal'] == True) & 
+            (result_df['book'].isin(self.all_internal_books))
+        ].copy()
+        
+        if internal_trades.empty:
+            debug_df = result_df.copy()
+            debug_df['debug_status'] = 'no_internal_trades'
+            debug_df['matching_approach'] = 'complex'
+            return result_df, debug_df
+        
+        # Find potential matching trades
+        matching_groups = self._find_matching_trades(internal_trades)
+        
+        processed_indices = set()
+        match_pair_counter = 1
+        
+        # Process matching groups
+        for base_id, indices in matching_groups.items():
+            if len(indices) == 1:
+                # Single trade - classify as unmatched
+                idx = indices[0]
+                trade = internal_trades.loc[idx]
+                trade_type = self._classify_unmatched_trade(trade)
+                result_df.loc[idx, 'internal_trade_type'] = trade_type
+                result_df.loc[idx, 'match_group_id'] = base_id
+                result_df.loc[idx, 'is_matched'] = False
+                processed_indices.add(idx)
+            else:
+                # Multiple trades - check for valid pairs
+                trades_group = internal_trades.loc[indices]
+                has_matches, valid_pairs = self._validate_inter_desk_match(trades_group)
+                
+                if has_matches:
+                    # Mark matched pairs as Type 1
+                    for idx1, idx2 in valid_pairs:
+                        pair_id = f"PAIR_{match_pair_counter}"
+                        result_df.loc[idx1, 'internal_trade_type'] = 'type_1_inter_desk'
+                        result_df.loc[idx1, 'match_group_id'] = base_id
+                        result_df.loc[idx1, 'is_matched'] = True
+                        result_df.loc[idx1, 'match_pair_id'] = pair_id
+                        
+                        result_df.loc[idx2, 'internal_trade_type'] = 'type_1_inter_desk'
+                        result_df.loc[idx2, 'match_group_id'] = base_id
+                        result_df.loc[idx2, 'is_matched'] = True
+                        result_df.loc[idx2, 'match_pair_id'] = pair_id
+                        
+                        processed_indices.add(idx1)
+                        processed_indices.add(idx2)
+                        match_pair_counter += 1
+                
+                # Handle remaining unmatched trades in the group
+                unmatched_in_group = set(indices) - processed_indices
+                for idx in unmatched_in_group:
+                    trade = internal_trades.loc[idx]
+                    trade_type = self._classify_unmatched_trade(trade)
+                    result_df.loc[idx, 'internal_trade_type'] = trade_type
+                    result_df.loc[idx, 'match_group_id'] = base_id
+                    result_df.loc[idx, 'is_matched'] = False
+                    processed_indices.add(idx)
+        
+        # Create debug dataframe
+        debug_df = result_df.copy()
+        debug_df['original_index'] = debug_df.index
+        debug_df['matching_approach'] = 'complex'
+        debug_df['desk_classification'] = debug_df['book'].apply(
+            lambda x: 'our_desk' if x in self.our_desk_books 
+            else 'other_internal_desk' if x in self.all_internal_books 
+            else 'external'
+        )
+        
+        return result_df, debug_df
+    
+    def get_summary_statistics(self, df: pd.DataFrame) -> Dict:
+        """Generate comprehensive summary statistics."""
+        internal_trades = df[df['internal_trade_type'].notna()]
+        
+        # Count by counterparty (internal trades only)
+        counterparty_counts = internal_trades['counterparty'].value_counts().to_dict()
+        
+        # Count matched trades by counterparty
+        matched_trades = internal_trades[internal_trades['is_matched'] == True]
+        matched_counterparty_counts = matched_trades['counterparty'].value_counts().to_dict()
+        
+        summary = {
+            'original_total_trades': len(df),
+            'total_internal_trades': len(internal_trades),
+            'total_matched_trades': len(matched_trades),
+            'total_unmatched_internal_trades': len(internal_trades[internal_trades['is_matched'] == False]),
+            'type_1_inter_desk': len(internal_trades[internal_trades['internal_trade_type'] == 'type_1_inter_desk']),
+            'type_2_other_to_our': len(internal_trades[internal_trades['internal_trade_type'] == 'type_2_other_to_our']),
+            'type_3_our_to_other': len(internal_trades[internal_trades['internal_trade_type'] == 'type_3_our_to_other']),
+            'matched_pairs_count': len(matched_trades) // 2,
+            'internal_trades_by_counterparty': counterparty_counts,
+            'matched_trades_by_counterparty': matched_counterparty_counts
+        }
+        
+        return summary
+    
+    def export_to_excel(self, df: pd.DataFrame, debug_df: pd.DataFrame, filename: str = None, approach: str = "complex"):
+        """Export results to Excel with multiple sheets."""
+        if filename is None:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"internal_trades_analysis_{approach}_{timestamp}.xlsx"
+        
+        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+            # Main results
+            df.to_excel(writer, sheet_name='Processed_Trades', index=False)
+            
+            # Debug information
+            debug_df.to_excel(writer, sheet_name='Debug_Info', index=False)
+            
+            # Internal trades only
+            internal_only = df[df['internal_trade_type'].notna()]
+            internal_only.to_excel(writer, sheet_name='Internal_Trades_Only', index=False)
+            
+            # Matched pairs
+            matched_only = df[df['is_matched'] == True]
+            matched_only.to_excel(writer, sheet_name='Matched_Pairs', index=False)
+            
+            # Summary statistics
+            summary = self.get_summary_statistics(df)
+            summary_df = pd.DataFrame(list(summary.items()), columns=['Metric', 'Value'])
+            summary_df.to_excel(writer, sheet_name='Summary', index=False)
+        
+        print(f"Results exported to {filename}")
+        return filename
+
+# Generate realistic sample data
+def generate_sample_data(num_trades: int = 100) -> pd.DataFrame:
+    """Generate realistic sample trading data."""
+    np.random.seed(42)
+    random.seed(42)
+    
+    # Book IDs
+    all_books = ['BK001', 'BK002', 'BK003', 'BK004', 'BK005', 'BK006', 'BK007', 
+                 'BK008', 'BK009', 'BK010', 'BK011', 'BK012', 'BK013', 'BK014', 
+                 'BK015', 'BK016', 'BK017', 'EXT001', 'EXT002']  # Last 2 are external
+    
+    # Sample ISINs and security details
+    securities = [
+        {'isin': 'US912828R770', 'cusip': '912828R77', 'ticker': 'T 2.75 11/15/2042', 'sector': 'Government', 'rating': 'AAA'},
+        {'isin': 'US037833100', 'cusip': '037833100', 'ticker': 'AAPL 3.45 02/09/2045', 'sector': 'Technology', 'rating': 'AA+'},
+        {'isin': 'US17275R102', 'cusip': '17275R102', 'ticker': 'CSCO 5.90 02/15/2039', 'sector': 'Technology', 'rating': 'AA'},
+        {'isin': 'US30303M102', 'cusip': '30303M102', 'ticker': 'META 4.45 08/15/2052', 'sector': 'Technology', 'rating': 'A+'},
+        {'isin': 'US02079K305', 'cusip': '02079K305', 'ticker': 'GOOGL 2.25 08/15/2060', 'sector': 'Technology', 'rating': 'AA'},
+        {'isin': 'GB00B4L5XY16', 'cusip': 'B4L5XY16', 'ticker': 'GILTS 4.25 12/07/2055', 'sector': 'Government', 'rating': 'AA'},
+        {'isin': 'DE0001102309', 'cusip': '110230900', 'ticker': 'DBR 2.50 08/15/2046', 'sector': 'Government', 'rating': 'AAA'},
+    ]
+    
+    currencies = ['USD', 'EUR', 'GBP', 'JPY']
+    trade_types = ['repo', 'reverse_repo', 'bond_borrow', 'bond_lend', 'outright_buy', 'outright_sell']
+    
+    data = []
+    base_trade_id = 1000
+    
+    # Generate matched pairs first (Type 1)
+    for i in range(num_trades // 4):  # 25% will be matched pairs
+        base_id = str(base_trade_id + i)
+        security = random.choice(securities)
+        currency = random.choice(currencies)
+        notional = random.randint(1000000, 50000000)
+        maturity = (datetime.now() + timedelta(days=random.randint(30, 1095))).strftime('%Y-%m-%d')
+        
+        # Our desk books for matched pairs
+        book1 = random.choice(['BK001', 'BK002', 'BK003', 'BK004'])
+        book2 = random.choice(['BK001', 'BK002', 'BK003', 'BK004'])
+        while book2 == book1:
+            book2 = random.choice(['BK001', 'BK002', 'BK003', 'BK004'])
+        
+        # Create matched pair
+        trade_types_pair = [('repo', 'reverse_repo'), ('bond_borrow', 'bond_lend')]
+        selected_types = random.choice(trade_types_pair)
+        
+        # Trade 1
+        data.append({
+            'trade_id': base_id,
+            'notional': notional,
+            'currency': currency,
+            'counterparty': book2,
+            'book': book1,
+            'maturity': maturity,
+            'isInternal': True,
+            'trade_type': selected_types[0],
+            'isin': security['isin'],
+            'cusip': security['cusip'],
+            'ticker': security['ticker'],
+            'sector': security['sector'],
+            'rating': security['rating'],
+            'trade_date': (datetime.now() - timedelta(days=random.randint(0, 30))).strftime('%Y-%m-%d'),
+            'settlement_date': (datetime.now() + timedelta(days=random.randint(1, 3))).strftime('%Y-%m-%d'),
+            'price': round(random.uniform(95.0, 105.0), 4),
+            'accrued_interest': round(random.uniform(0, 2.5), 4)
+        })
+        
+        # Trade 2 (matching)
+        data.append({
+            'trade_id': base_id + '_CA',
+            'notional': -notional,  # Opposite sign
+            'currency': currency,
+            'counterparty': book1,
+            'book': book2,
+            'maturity': maturity,
+            'isInternal': True,
+            'trade_type': selected_types[1],
+            'isin': security['isin'],
+            'cusip': security['cusip'],
+            'ticker': security['ticker'],
+            'sector': security['sector'],
+            'rating': security['rating'],
+            'trade_date': (datetime.now() - timedelta(days=random.randint(0, 30))).strftime('%Y-%m-%d'),
+            'settlement_date': (datetime.now() + timedelta(days=random.randint(1, 3))).strftime('%Y-%m-%d'),
+            'price': round(random.uniform(95.0, 105.0), 4),
+            'accrued_interest': round(random.uniform(0, 2.5), 4)
+        })
+    
+    # Generate unmatched internal trades
+    base_trade_id += num_trades // 4
+    for i in range(num_trades // 3):  # 33% unmatched internal
+        security = random.choice(securities)
+        currency = random.choice(currencies)
+        
+        data.append({
+            'trade_id': str(base_trade_id + i) + random.choice(['', '_CA']),
+            'notional': random.randint(500000, 20000000) * random.choice([-1, 1]),
+            'currency': currency,
+            'counterparty': random.choice(all_books),
+            'book': random.choice(all_books[:-2]),  # Exclude external books
+            'maturity': (datetime.now() + timedelta(days=random.randint(30, 1095))).strftime('%Y-%m-%d'),
+            'isInternal': True,
+            'trade_type': random.choice(trade_types),
+            'isin': security['isin'],
+            'cusip': security['cusip'],
+            'ticker': security['ticker'],
+            'sector': security['sector'],
+            'rating': security['rating'],
+            'trade_date': (datetime.now() - timedelta(days=random.randint(0, 30))).strftime('%Y-%m-%d'),
+            'settlement_date': (datetime.now() + timedelta(days=random.randint(1, 3))).strftime('%Y-%m-%d'),
+            'price': round(random.uniform(95.0, 105.0), 4),
+            'accrued_interest': round(random.uniform(0, 2.5), 4)
+        })
+    
+    # Generate external trades
+    base_trade_id += num_trades // 3
+    remaining_trades = num_trades - len(data)
+    for i in range(remaining_trades):
+        security = random.choice(securities)
+        currency = random.choice(currencies)
+        
+        data.append({
+            'trade_id': str(base_trade_id + i),
+            'notional': random.randint(1000000, 100000000) * random.choice([-1, 1]),
+            'currency': currency,
+            'counterparty': random.choice(['EXT001', 'EXT002', 'GOLDMAN_SACHS', 'JP_MORGAN', 'BARCLAYS']),
+            'book': random.choice(all_books[:-2]),
+            'maturity': (datetime.now() + timedelta(days=random.randint(30, 1095))).strftime('%Y-%m-%d'),
+            'isInternal': False,
+            'trade_type': random.choice(trade_types),
+            'isin': security['isin'],
+            'cusip': security['cusip'],
+            'ticker': security['ticker'],
+            'sector': security['sector'],
+            'rating': security['rating'],
+            'trade_date': (datetime.now() - timedelta(days=random.randint(0, 30))).strftime('%Y-%m-%d'),
+            'settlement_date': (datetime.now() + timedelta(days=random.randint(1, 3))).strftime('%Y-%m-%d'),
+            'price': round(random.uniform(95.0, 105.0), 4),
+            'accrued_interest': round(random.uniform(0, 2.5), 4)
+        })
+    
+    return pd.DataFrame(data)
+
+# Example usage - comparing both approaches
+if __name__ == "__main__":
+    # External books (only 2 as specified)
+    external_books = ['EXT001', 'EXT002']
+    
+    # Initialize the matching engine
+    matcher = InternalTradeMatchingEngine(external_books)
+    
+    # Generate sample data
+    df = generate_sample_data(100)
+    print(f"Generated {len(df)} sample trades")
+    
+    # Test both approaches
+    print("\n" + "="*60)
+    print("SIMPLE APPROACH RESULTS")
+    print("="*60)
+    
+    # Process trades with simple approach
+    simple_result_df, simple_debug_df = matcher.process_trades_simple(df)
+    
+    # Display simple approach results
+    simple_internal = simple_result_df[simple_result_df['internal_trade_type'].notna()]
+    print(f"\nSimple Approach - Internal Trades Found: {len(simple_internal)}")
+    print(simple_internal[['trade_id', 'book', 'counterparty', 'internal_trade_type', 
+                          'is_matched', 'match_pair_id']].head(10))
+    
+    # Simple approach summary
+    simple_summary = matcher.get_summary_statistics(simple_result_df)
+    print(f"\nSimple Approach Summary:")
+    print(f"Total matched trades: {simple_summary['total_matched_trades']}")
+    print(f"Matched pairs: {simple_summary['matched_pairs_count']}")
+    print(f"Type 1 (inter-desk): {simple_summary['type_1_inter_desk']}")
+    
+    print("\n" + "="*60)
+    print("COMPLEX APPROACH RESULTS")
+    print("="*60)
+    
+    # Process trades with complex approach
+    complex_result_df, complex_debug_df = matcher.process_trades(df)
+    
+    # Display complex approach results
+    complex_internal = complex_result_df[complex_result_df['internal_trade_type'].notna()]
+    print(f"\nComplex Approach - Internal Trades Found: {len(complex_internal)}")
+    print(complex_internal[['trade_id', 'book', 'counterparty', 'internal_trade_type', 
+                           'is_matched', 'match_pair_id']].head(10))
+    
+    # Complex approach summary
+    complex_summary = matcher.get_summary_statistics(complex_result_df)
+    print(f"\nComplex Approach Summary:")
+    print(f"Total matched trades: {complex_summary['total_matched_trades']}")
+    print(f"Matched pairs: {complex_summary['matched_pairs_count']}")
+    print(f"Type 1 (inter-desk): {complex_summary['type_1_inter_desk']}")
+    
+    print("\n" + "="*60)
+    print("COMPARISON")
+    print("="*60)
+    print(f"Simple approach matched pairs: {simple_summary['matched_pairs_count']}")
+    print(f"Complex approach matched pairs: {complex_summary['matched_pairs_count']}")
+    print(f"Difference: {complex_summary['matched_pairs_count'] - simple_summary['matched_pairs_count']}")
+    
+    # Export both results
+    simple_filename = matcher.export_to_excel(simple_result_df, simple_debug_df, approach="simple")
+    complex_filename = matcher.export_to_excel(complex_result_df, complex_debug_df, approach="complex")
+    
+    print(f"\nSimple approach results exported to: {simple_filename}")
+    print(f"Complex approach results exported to: {complex_filename}")
+    
+    print(f"\nRecommendation:")
+    if simple_summary['matched_pairs_count'] == complex_summary['matched_pairs_count']:
+        print("✅ Both approaches yield the same results. Use simple approach for better performance.")
+    else:
+        print("⚠️  Complex approach found more matches. Consider using complex approach for completeness.")
+        print("   Use simple approach if performance is critical and the difference is acceptable.")
