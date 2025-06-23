@@ -1,0 +1,479 @@
+import pandas as pd
+import numpy as np
+import re
+from typing import Dict, List, Tuple, Optional, Any
+from enum import Enum
+
+# Global Constants and Enums
+class SystemType(Enum):
+    SUMMIT = 'summit'
+    MAGELLAN = 'magellan'
+    LEGACY_SYSTEM = 'legacy_system'
+    UNKNOWN = 'unknown'
+
+class ParseStatus(Enum):
+    SUCCESS = 'SUCCESS'
+    FAILED = 'FAILED'
+
+class ColumnNames(Enum):
+    TRADE_ID = 'trade_id'
+    SYSTEM_TYPE = 'system_type'
+    PATTERN_MATCHED = 'pattern_matched'
+    CURRENCY = 'currency'
+    TRADE_DATE = 'trade_date'
+    CPTY_CODE = 'cpty_code'
+    CPTY_NAME = 'cpty_name'
+    YEAR = 'year'
+    TRADE_REF = 'trade_ref'
+    PRODUCT_TYPE = 'product_type'
+    PRODUCT_NAME = 'product_name'
+    REGION = 'region'
+    PARSE_STATUS = 'parse_status'
+
+class MappingType(Enum):
+    COUNTERPARTY = 'counterparty'
+    PRODUCT = 'product'
+    REGION = 'region'
+
+class TradeIdParser:
+    """
+    A comprehensive trade ID parser for legacy trade systems.
+    Supports multiple booking systems with different patterns and mapping requirements.
+    Uses wrapper functions to fetch reference data mappings dynamically.
+    """
+    
+    def __init__(self):
+        # System patterns - each system can have multiple patterns
+        self.system_patterns = {
+            SystemType.SUMMIT.value: [
+                r'^SMT-([A-Z]{3})-(\d{6})-([A-Z]{2,4})-(\d{4})$',  # Pattern 1: SMT-USD-123456-BARC-2023
+                r'^SUMMIT_([A-Z]{3})_(\d{8})_([A-Z]{3,5})$',        # Pattern 2: SUMMIT_EUR_20231201_CITI
+            ],
+            SystemType.MAGELLAN.value: [
+                r'^MAG(\d{4})([A-Z]{4})(\d{6})([A-Z]{2})$',         # Pattern 1: MAG2023BARC123456FX
+                r'^MGL-([A-Z]{3})-([A-Z]{4})-(\d{8})-([A-Z]{2})$',  # Pattern 2: MGL-USD-CITI-20231201-IR
+            ],
+            SystemType.LEGACY_SYSTEM.value: [
+                r'^LEG_([A-Z]{2,3})_(\d{4})_([A-Z]{3,4})_(\d{6})$', # Pattern 1: LEG_US_2023_JPM_123456
+            ]
+        }
+        
+        # Field mappings for each system pattern
+        self.pattern_mappings = {
+            SystemType.SUMMIT.value: {
+                0: [ColumnNames.CURRENCY.value, ColumnNames.TRADE_DATE.value, ColumnNames.CPTY_CODE.value, ColumnNames.YEAR.value],
+                1: [ColumnNames.CURRENCY.value, ColumnNames.TRADE_DATE.value, ColumnNames.CPTY_CODE.value]
+            },
+            SystemType.MAGELLAN.value: {
+                0: [ColumnNames.YEAR.value, ColumnNames.CPTY_CODE.value, ColumnNames.TRADE_REF.value, ColumnNames.PRODUCT_TYPE.value],
+                1: [ColumnNames.CURRENCY.value, ColumnNames.CPTY_CODE.value, ColumnNames.TRADE_DATE.value, ColumnNames.PRODUCT_TYPE.value]
+            },
+            SystemType.LEGACY_SYSTEM.value: {
+                0: [ColumnNames.REGION.value, ColumnNames.YEAR.value, ColumnNames.CPTY_CODE.value, ColumnNames.TRADE_REF.value]
+            }
+        }
+        
+        # Define which mappings each system requires
+        self.system_mapping_requirements = {
+            SystemType.SUMMIT.value: [MappingType.COUNTERPARTY.value],
+            SystemType.MAGELLAN.value: [MappingType.COUNTERPARTY.value, MappingType.PRODUCT.value],
+            SystemType.LEGACY_SYSTEM.value: [MappingType.COUNTERPARTY.value, MappingType.REGION.value]
+        }
+        
+        # Cache for loaded mappings
+        self._mapping_cache = {}
+    
+    def parse(self, df: pd.DataFrame, trade_id_column: str = ColumnNames.TRADE_ID.value) -> pd.DataFrame:
+        """
+        Main parsing method that processes all systems sequentially.
+        
+        Args:
+            df: DataFrame containing trade IDs
+            trade_id_column: Name of the column containing trade IDs
+            
+        Returns:
+            DataFrame with parsed trade ID attributes
+        """
+        if trade_id_column not in df.columns:
+            raise ValueError(f"Column '{trade_id_column}' not found in DataFrame")
+        
+        # Initialize result columns
+        result_df = df.copy()
+        
+        # Add columns for parsed attributes
+        new_columns = [col.value for col in ColumnNames if col != ColumnNames.TRADE_ID]
+        
+        for col in new_columns:
+            if col not in result_df.columns:
+                result_df[col] = np.nan
+        
+        # Process each trade ID
+        for idx, trade_id in df[trade_id_column].items():
+            parsed_result = self._parse_single_trade_id(str(trade_id))
+            
+            # Update DataFrame with parsed results
+            for key, value in parsed_result.items():
+                if key in result_df.columns:
+                    result_df.at[idx, key] = value
+        
+        return result_df
+    
+    def _parse_single_trade_id(self, trade_id: str) -> Dict[str, Any]:
+        """
+        Parse a single trade ID across all systems and patterns.
+        
+        Args:
+            trade_id: The trade ID string to parse
+            
+        Returns:
+            Dictionary containing parsed attributes
+        """
+        result = {
+            ColumnNames.SYSTEM_TYPE.value: None,
+            ColumnNames.PATTERN_MATCHED.value: None,
+            ColumnNames.PARSE_STATUS.value: ParseStatus.FAILED.value
+        }
+        
+        # Try each system sequentially
+        for system_type in SystemType:
+            if system_type == SystemType.UNKNOWN:
+                continue
+                
+            handler_result = self._get_system_handler(system_type.value)(trade_id)
+            if handler_result[ColumnNames.PARSE_STATUS.value] == ParseStatus.SUCCESS.value:
+                result.update(handler_result)
+                break
+        
+        return result
+    
+    def _get_system_handler(self, system_name: str):
+        """Get the appropriate handler method for a system."""
+        handler_map = {
+            SystemType.SUMMIT.value: self._handle_summit,
+            SystemType.MAGELLAN.value: self._handle_magellan,
+            SystemType.LEGACY_SYSTEM.value: self._handle_legacy_system
+        }
+        return handler_map.get(system_name, self._handle_unknown)
+    
+    def _handle_summit(self, trade_id: str) -> Dict[str, Any]:
+        """Handler for Summit system trade IDs."""
+        result = self._generic_pattern_handler(SystemType.SUMMIT.value, trade_id)
+        
+        if result[ColumnNames.PARSE_STATUS.value] == ParseStatus.SUCCESS.value:
+            # Load required mappings for Summit system
+            self._load_system_mappings(SystemType.SUMMIT.value)
+            # Apply mappings
+            result = self._apply_mappings(result, SystemType.SUMMIT.value)
+        
+        return result
+    
+    def _handle_magellan(self, trade_id: str) -> Dict[str, Any]:
+        """Handler for Magellan system trade IDs."""
+        result = self._generic_pattern_handler(SystemType.MAGELLAN.value, trade_id)
+        
+        if result[ColumnNames.PARSE_STATUS.value] == ParseStatus.SUCCESS.value:
+            # Load required mappings for Magellan system
+            self._load_system_mappings(SystemType.MAGELLAN.value)
+            # Apply mappings
+            result = self._apply_mappings(result, SystemType.MAGELLAN.value)
+        
+        return result
+    
+    def _handle_legacy_system(self, trade_id: str) -> Dict[str, Any]:
+        """Handler for Legacy system trade IDs."""
+        result = self._generic_pattern_handler(SystemType.LEGACY_SYSTEM.value, trade_id)
+        
+        if result[ColumnNames.PARSE_STATUS.value] == ParseStatus.SUCCESS.value:
+            # Load required mappings for Legacy system
+            self._load_system_mappings(SystemType.LEGACY_SYSTEM.value)
+            # Apply mappings
+            result = self._apply_mappings(result, SystemType.LEGACY_SYSTEM.value)
+        
+        return result
+    
+    def _handle_unknown(self, trade_id: str) -> Dict[str, Any]:
+        """Handler for unknown system trade IDs."""
+        return {
+            ColumnNames.SYSTEM_TYPE.value: SystemType.UNKNOWN.value.upper(),
+            ColumnNames.PATTERN_MATCHED.value: None,
+            ColumnNames.PARSE_STATUS.value: ParseStatus.FAILED.value
+        }
+    
+    def _generic_pattern_handler(self, system_name: str, trade_id: str) -> Dict[str, Any]:
+        """
+        Generic pattern matching handler for any system.
+        
+        Args:
+            system_name: Name of the system
+            trade_id: Trade ID to parse
+            
+        Returns:
+            Dictionary with parsed results
+        """
+        patterns = self.system_patterns.get(system_name, [])
+        mappings = self.pattern_mappings.get(system_name, {})
+        
+        for pattern_idx, pattern in enumerate(patterns):
+            match = re.match(pattern, trade_id)
+            if match:
+                # Extract matched groups
+                groups = match.groups()
+                field_names = mappings.get(pattern_idx, [])
+                
+                # Build result dictionary
+                result = {
+                    ColumnNames.SYSTEM_TYPE.value: system_name.upper(),
+                    ColumnNames.PATTERN_MATCHED.value: pattern_idx,
+                    ColumnNames.PARSE_STATUS.value: ParseStatus.SUCCESS.value
+                }
+                
+                # Map extracted values to field names
+                for i, field_name in enumerate(field_names):
+                    if i < len(groups):
+                        result[field_name] = groups[i]
+                
+                return result
+        
+        return {
+            ColumnNames.SYSTEM_TYPE.value: system_name.upper(),
+            ColumnNames.PATTERN_MATCHED.value: None,
+            ColumnNames.PARSE_STATUS.value: ParseStatus.FAILED.value
+        }
+    
+    def _load_system_mappings(self, system_name: str):
+        """
+        Load required mappings for a system using wrapper functions.
+        Mappings are cached to avoid repeated calls.
+        
+        Args:
+            system_name: Name of the system
+        """
+        required_mappings = self.system_mapping_requirements.get(system_name, [])
+        
+        for mapping_type in required_mappings:
+            cache_key = f"{system_name}_{mapping_type}"
+            
+            if cache_key not in self._mapping_cache:
+                # Call appropriate wrapper function based on mapping type
+                if mapping_type == MappingType.COUNTERPARTY.value:
+                    self._mapping_cache[cache_key] = self._get_counterparty_mapping(system_name)
+                elif mapping_type == MappingType.PRODUCT.value:
+                    self._mapping_cache[cache_key] = self._get_product_mapping(system_name)
+                elif mapping_type == MappingType.REGION.value:
+                    self._mapping_cache[cache_key] = self._get_region_mapping(system_name)
+    
+    def _get_counterparty_mapping(self, system_name: str) -> Dict[str, str]:
+        """
+        Wrapper function to fetch counterparty mappings from reference data.
+        This should be replaced with your actual refdata wrapper function.
+        
+        Args:
+            system_name: Name of the system
+            
+        Returns:
+            Dictionary mapping counterparty codes to names
+        """
+        # TODO: Replace this with your actual refdata wrapper function
+        # Example: return your_refdata_wrapper.get_counterparty_mapping(system_name)
+        
+        # Hardcoded sample data for demonstration
+        return {
+            'BARC': 'Barclays Bank PLC',
+            'CITI': 'Citibank N.A.',
+            'JPM': 'JPMorgan Chase Bank',
+            'GSCO': 'Goldman Sachs & Co',
+            'MS': 'Morgan Stanley',
+            'DB': 'Deutsche Bank AG',
+            'UBS': 'UBS AG',
+            'CS': 'Credit Suisse',
+            'BNP': 'BNP Paribas',
+            'SG': 'Societe Generale'
+        }
+    
+    def _get_product_mapping(self, system_name: str) -> Dict[str, str]:
+        """
+        Wrapper function to fetch product mappings from reference data.
+        This should be replaced with your actual refdata wrapper function.
+        
+        Args:
+            system_name: Name of the system
+            
+        Returns:
+            Dictionary mapping product codes to names
+        """
+        # TODO: Replace this with your actual refdata wrapper function
+        # Example: return your_refdata_wrapper.get_product_mapping(system_name)
+        
+        # Hardcoded sample data for demonstration
+        return {
+            'FX': 'Foreign Exchange',
+            'IR': 'Interest Rate',
+            'EQ': 'Equity',
+            'CD': 'Credit',
+            'CM': 'Commodity'
+        }
+    
+    def _get_region_mapping(self, system_name: str) -> Dict[str, str]:
+        """
+        Wrapper function to fetch region mappings from reference data.
+        This should be replaced with your actual refdata wrapper function.
+        
+        Args:
+            system_name: Name of the system
+            
+        Returns:
+            Dictionary mapping region codes to names
+        """
+        # TODO: Replace this with your actual refdata wrapper function
+        # Example: return your_refdata_wrapper.get_region_mapping(system_name)
+        
+        # Hardcoded sample data for demonstration
+        return {
+            'US': 'United States',
+            'EU': 'Europe',
+            'AS': 'Asia',
+            'UK': 'United Kingdom'
+        }
+    
+    def _apply_mappings(self, parsed_data: Dict[str, Any], system_name: str) -> Dict[str, Any]:
+        """
+        Apply loaded mappings to parsed data.
+        
+        Args:
+            parsed_data: Dictionary containing parsed trade data
+            system_name: Name of the system
+            
+        Returns:
+            Dictionary with additional mapped fields
+        """
+        result = parsed_data.copy()
+        
+        # Apply counterparty mapping if available
+        cpty_cache_key = f"{system_name}_{MappingType.COUNTERPARTY.value}"
+        if (cpty_cache_key in self._mapping_cache and 
+            ColumnNames.CPTY_CODE.value in result and 
+            result[ColumnNames.CPTY_CODE.value]):
+            
+            cpty_mapping = self._mapping_cache[cpty_cache_key]
+            result[ColumnNames.CPTY_NAME.value] = cpty_mapping.get(
+                result[ColumnNames.CPTY_CODE.value], 'Unknown'
+            )
+        
+        # Apply product mapping if available
+        product_cache_key = f"{system_name}_{MappingType.PRODUCT.value}"
+        if (product_cache_key in self._mapping_cache and 
+            ColumnNames.PRODUCT_TYPE.value in result and 
+            result[ColumnNames.PRODUCT_TYPE.value]):
+            
+            product_mapping = self._mapping_cache[product_cache_key]
+            result[ColumnNames.PRODUCT_NAME.value] = product_mapping.get(
+                result[ColumnNames.PRODUCT_TYPE.value], 'Unknown'
+            )
+        
+        # Apply region mapping if available
+        region_cache_key = f"{system_name}_{MappingType.REGION.value}"
+        if (region_cache_key in self._mapping_cache and 
+            ColumnNames.REGION.value in result and 
+            result[ColumnNames.REGION.value]):
+            
+            region_mapping = self._mapping_cache[region_cache_key]
+            # For region, we might want to keep the original code and add a description
+            # or replace it entirely - adjust based on your needs
+            pass
+        
+        # Format trade date if it's in YYYYMMDD format
+        if (ColumnNames.TRADE_DATE.value in result and 
+            result[ColumnNames.TRADE_DATE.value]):
+            
+            trade_date = str(result[ColumnNames.TRADE_DATE.value])
+            if len(trade_date) == 8 and trade_date.isdigit():
+                try:
+                    formatted_date = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
+                    result[ColumnNames.TRADE_DATE.value] = formatted_date
+                except:
+                    pass
+        
+        return result
+    
+    def get_parsing_stats(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Get statistics about parsing results.
+        
+        Args:
+            df: DataFrame with parsed results
+            
+        Returns:
+            Dictionary containing parsing statistics
+        """
+        if ColumnNames.PARSE_STATUS.value not in df.columns:
+            return {'error': 'DataFrame not parsed yet'}
+        
+        total_records = len(df)
+        successful_parses = len(df[df[ColumnNames.PARSE_STATUS.value] == ParseStatus.SUCCESS.value])
+        failed_parses = total_records - successful_parses
+        
+        system_breakdown = df[df[ColumnNames.PARSE_STATUS.value] == ParseStatus.SUCCESS.value][ColumnNames.SYSTEM_TYPE.value].value_counts().to_dict()
+        
+        return {
+            'total_records': total_records,
+            'successful_parses': successful_parses,
+            'failed_parses': failed_parses,
+            'success_rate': round((successful_parses / total_records) * 100, 2) if total_records > 0 else 0,
+            'system_breakdown': system_breakdown
+        }
+
+
+# Example usage and test data
+def create_sample_data():
+    """Create sample trade data for testing."""
+    sample_trade_ids = [
+        'SMT-USD-123456-BARC-2023',      # Summit pattern 1
+        'SUMMIT_EUR_20231201_CITI',      # Summit pattern 2
+        'MAG2023BARC123456FX',           # Magellan pattern 1
+        'MGL-USD-CITI-20231201-IR',      # Magellan pattern 2
+        'LEG_US_2023_JPM_123456',        # Legacy system
+        'INVALID_TRADE_ID',              # Invalid format
+        'SMT-GBP-789012-GSCO-2024',      # Another Summit pattern 1
+        'MGL-EUR-UBS-20240115-EQ',       # Another Magellan pattern 2
+    ]
+    
+    df = pd.DataFrame({
+        ColumnNames.TRADE_ID.value: sample_trade_ids,
+        'amount': [1000000, 2500000, 750000, 1200000, 900000, 0, 1800000, 3000000],
+        'existing_column': ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
+    })
+    
+    return df
+
+# Example usage
+if __name__ == "__main__":
+    # Initialize parser
+    parser = TradeIdParser()
+    
+    # Create sample data
+    df = create_sample_data()
+    print("Original DataFrame:")
+    print(df)
+    print("\n" + "="*80 + "\n")
+    
+    # Parse trade IDs
+    parsed_df = parser.parse(df)
+    
+    # Display results
+    print("Parsed DataFrame:")
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', None)
+    print(parsed_df)
+    
+    print("\n" + "="*80 + "\n")
+    
+    # Show parsing statistics
+    stats = parser.get_parsing_stats(parsed_df)
+    print("Parsing Statistics:")
+    for key, value in stats.items():
+        print(f"{key}: {value}")
+    
+    print("\n" + "="*80 + "\n")
+    
+    print("Pattern definitions and logic are encapsulated within the class")
+    print("Mappings are loaded dynamically using wrapper functions after parsing")
