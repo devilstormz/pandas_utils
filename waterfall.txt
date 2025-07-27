@@ -1,0 +1,308 @@
+import pandas as pd
+import numpy as np
+from enum import Enum
+from typing import List, Dict, Tuple, NamedTuple, Optional
+
+
+class TradeType(Enum):
+    BOND_BORROW = "bond_borrow"
+    BOND_LEND = "bond_lend"
+    OTHER = "other"
+
+
+class BookAccountingTreatment(Enum):
+    ACA = "ACA"
+    OTHER = "OTHER"
+
+
+class SwapReason(Enum):
+    BOND_CPTY_EXCLUSION = "Bond trade with excluded counterparty"
+    BOOK_CPTY_EXCLUSION = "Trade in excluded book or counterparty"
+    NON_ACA_ACCOUNTING = "Non-ACA accounting treatment"
+    LOW_GROUP_VALUE = "Group market value below threshold"
+    HIGH_GROUP_VALUE = "Group market value above threshold"
+
+
+class ColumnNames(NamedTuple):
+    trade_id: str = "trade_id"
+    counterparty: str = "counterparty"
+    currency: str = "currency"
+    notional: str = "notional"
+    book: str = "book"
+    book_accounting_treatment: str = "book_accounting_treatment"
+    group_key: str = "group_key"
+    market_value: str = "market_value"
+    trade_type: str = "trade_type"
+    
+    # Output columns
+    rule_1: str = "rule_1"
+    rule_2: str = "rule_2"
+    rule_3: str = "rule_3"
+    rule_4: str = "rule_4"
+    collateral_swap_flag: str = "collateral_swap_flag"
+    collateral_swap_reason: str = "collateral_swap_reason"
+    sequential_swap_id: str = "sequential_swap_id"
+
+
+class CollateralSwapConfig:
+    def __init__(self, 
+                 excluded_counterparties: List[str],
+                 excluded_books: List[str],
+                 excluded_counterparties_book_rule: List[str],
+                 group_value_threshold: float = 1e6):
+        self.excluded_counterparties = excluded_counterparties
+        self.excluded_books = excluded_books
+        self.excluded_counterparties_book_rule = excluded_counterparties_book_rule
+        self.group_value_threshold = group_value_threshold
+
+
+class CollateralSwapAnalyzer:
+    """
+    A class to analyze trade data and determine collateral swap indicators using waterfall logic.
+    """
+    
+    def __init__(self, config: CollateralSwapConfig):
+        self.config = config
+        self.cols = ColumnNames()
+        
+    def analyze_trades(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Apply waterfall logic to determine collateral swap indicators.
+        
+        Args:
+            df: DataFrame with trade data
+            
+        Returns:
+            DataFrame with additional columns for collateral swap analysis
+        """
+        # Create a copy to avoid modifying original data
+        result_df = df.copy()
+        
+        # Calculate group market value sums
+        group_mv_sums = result_df.groupby(self.cols.group_key)[self.cols.market_value].sum()
+        result_df['group_mv_sum'] = result_df[self.cols.group_key].map(group_mv_sums)
+        
+        # Initialize debug columns
+        result_df[self.cols.rule_1] = False
+        result_df[self.cols.rule_2] = False
+        result_df[self.cols.rule_3] = False
+        result_df[self.cols.rule_4] = False
+        
+        # Rule 1: Bond trade with excluded counterparty
+        rule_1_condition = (
+            (result_df[self.cols.counterparty].isin(self.config.excluded_counterparties)) &
+            (result_df[self.cols.trade_type].isin([TradeType.BOND_BORROW.value, TradeType.BOND_LEND.value]))
+        )
+        result_df[self.cols.rule_1] = rule_1_condition
+        
+        # Rule 2: Excluded book or counterparty
+        rule_2_condition = (
+            (result_df[self.cols.book].isin(self.config.excluded_books)) |
+            (result_df[self.cols.counterparty].isin(self.config.excluded_counterparties_book_rule))
+        ) & (~rule_1_condition)  # Only apply if rule 1 didn't already exclude
+        result_df[self.cols.rule_2] = rule_2_condition
+        
+        # Rule 3: Non-ACA accounting treatment
+        rule_3_condition = (
+            (result_df[self.cols.book_accounting_treatment] != BookAccountingTreatment.ACA.value) &
+            (~rule_1_condition) & (~rule_2_condition)
+        )
+        result_df[self.cols.rule_3] = rule_3_condition
+        
+        # Rule 4: Group market value threshold
+        rule_4_low_condition = (
+            (result_df['group_mv_sum'] < self.config.group_value_threshold) &
+            (~rule_1_condition) & (~rule_2_condition) & (~rule_3_condition)
+        )
+        rule_4_high_condition = (
+            (result_df['group_mv_sum'] >= self.config.group_value_threshold) &
+            (~rule_1_condition) & (~rule_2_condition) & (~rule_3_condition)
+        )
+        result_df[self.cols.rule_4] = rule_4_low_condition | rule_4_high_condition
+        
+        # Apply waterfall logic using numpy.select
+        conditions = [
+            rule_1_condition,
+            rule_2_condition,
+            rule_3_condition,
+            rule_4_low_condition,
+            rule_4_high_condition
+        ]
+        
+        choices_flag = [False, False, True, True, False]
+        choices_reason = [
+            SwapReason.BOND_CPTY_EXCLUSION.value,
+            SwapReason.BOOK_CPTY_EXCLUSION.value,
+            SwapReason.NON_ACA_ACCOUNTING.value,
+            SwapReason.LOW_GROUP_VALUE.value,
+            SwapReason.HIGH_GROUP_VALUE.value
+        ]
+        
+        result_df[self.cols.collateral_swap_flag] = np.select(conditions, choices_flag, default=False)
+        result_df[self.cols.collateral_swap_reason] = np.select(conditions, choices_reason, default="No rule applied")
+        
+        # Create sequential swap ID for collateral swaps only
+        swap_mask = result_df[self.cols.collateral_swap_flag]
+        result_df[self.cols.sequential_swap_id] = "0"  # Initialize as string to avoid dtype issues
+        
+        if swap_mask.any():
+            # Create unique swap groups and assign sequential IDs
+            swap_df = result_df[swap_mask].copy()
+            unique_groups = swap_df[self.cols.group_key].unique()
+            group_to_id = {group: f"{i+1}_{group}" for i, group in enumerate(unique_groups)}
+            
+            result_df.loc[swap_mask, self.cols.sequential_swap_id] = (
+                result_df.loc[swap_mask, self.cols.group_key].map(group_to_id)
+            )
+        
+        # Clean up temporary column
+        result_df.drop('group_mv_sum', axis=1, inplace=True)
+        
+        return result_df
+    
+    def get_collateral_swaps(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Returns only collateral swap trades ordered by sequential swap ID.
+        
+        Args:
+            df: Analyzed DataFrame from analyze_trades()
+            
+        Returns:
+            DataFrame containing only collateral swap trades
+        """
+        swap_df = df[df[self.cols.collateral_swap_flag]].copy()
+        if not swap_df.empty:
+            # Sort by sequential swap ID (extract numeric part for proper sorting)
+            swap_df['_sort_key'] = swap_df[self.cols.sequential_swap_id].str.extract(r'(\d+)').astype(int)
+            swap_df = swap_df.sort_values('_sort_key').drop('_sort_key', axis=1)
+        return swap_df
+    
+    def get_swaps_by_reason(self, df: pd.DataFrame, invert: bool = False) -> Dict[str, pd.DataFrame]:
+        """
+        Returns separate DataFrames for collateral swaps split by determination reason.
+        
+        Args:
+            df: Analyzed DataFrame from analyze_trades()
+            invert: If True, returns non-collateral swaps split by exclusion reason
+            
+        Returns:
+            Dictionary with reason as key and filtered DataFrame as value
+        """
+        if invert:
+            # Return non-swaps by exclusion reason
+            non_swap_df = df[~df[self.cols.collateral_swap_flag]].copy()
+            reasons = non_swap_df[self.cols.collateral_swap_reason].unique()
+        else:
+            # Return swaps by determination reason
+            swap_df = df[df[self.cols.collateral_swap_flag]].copy()
+            reasons = swap_df[self.cols.collateral_swap_reason].unique()
+        
+        result_dict = {}
+        
+        for reason in reasons:
+            if invert:
+                filtered_df = df[
+                    (~df[self.cols.collateral_swap_flag]) & 
+                    (df[self.cols.collateral_swap_reason] == reason)
+                ].copy()
+            else:
+                filtered_df = df[
+                    (df[self.cols.collateral_swap_flag]) & 
+                    (df[self.cols.collateral_swap_reason] == reason)
+                ].copy()
+            
+            if not filtered_df.empty and not invert:
+                # Sort swaps by sequential swap ID
+                filtered_df['_sort_key'] = filtered_df[self.cols.sequential_swap_id].str.extract(r'(\d+)').astype(int)
+                filtered_df = filtered_df.sort_values('_sort_key').drop('_sort_key', axis=1)
+            
+            result_dict[reason] = filtered_df
+        
+        return result_dict
+    
+    def get_analysis_summary(self, df: pd.DataFrame) -> Dict[str, any]:
+        """
+        Returns a summary of the collateral swap analysis.
+        
+        Args:
+            df: Analyzed DataFrame from analyze_trades()
+            
+        Returns:
+            Dictionary with analysis summary statistics
+        """
+        total_trades = len(df)
+        total_swaps = df[self.cols.collateral_swap_flag].sum()
+        
+        # Count by reason
+        reason_counts = df[self.cols.collateral_swap_reason].value_counts().to_dict()
+        
+        # Count by rule application
+        rule_counts = {
+            "Rule 1 (Bond + Counterparty)": int(df[self.cols.rule_1].sum()),
+            "Rule 2 (Book/Counterparty)": int(df[self.cols.rule_2].sum()),
+            "Rule 3 (Non-ACA Accounting)": int(df[self.cols.rule_3].sum()),
+            "Rule 4 (Group Value Threshold)": int(df[self.cols.rule_4].sum())
+        }
+        
+        return {
+            "total_trades": total_trades,
+            "total_collateral_swaps": int(total_swaps),
+            "collateral_swap_percentage": f"{(total_swaps/total_trades)*100:.2f}%",
+            "reason_breakdown": reason_counts,
+            "rule_application_counts": rule_counts
+        }
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Sample configuration
+    config = CollateralSwapConfig(
+        excluded_counterparties=["CPTY_EXCLUDED_1", "CPTY_EXCLUDED_2"],
+        excluded_books=["BOOK_A"],
+        excluded_counterparties_book_rule=["CPTY_A", "CPTY_B"],
+        group_value_threshold=1e6
+    )
+    
+    # Create sample data
+    sample_data = {
+        "trade_id": [f"T{i:04d}" for i in range(1, 21)],
+        "counterparty": ["CPTY_EXCLUDED_1"] * 3 + ["CPTY_A"] * 3 + ["CPTY_C"] * 14,
+        "currency": ["USD"] * 20,
+        "notional": [1000000] * 20,
+        "book": ["BOOK_A"] * 2 + ["BOOK_B"] * 18,
+        "book_accounting_treatment": ["ACA"] * 15 + ["OTHER"] * 5,
+        "group_key": [f"CPTY_EXCLUDED_1_2024-01-01"] * 3 + [f"CPTY_A_2024-01-01"] * 3 + 
+                    [f"CPTY_C_2024-01-01"] * 8 + [f"CPTY_C_2024-02-01"] * 6,
+        "market_value": [500000] * 10 + [2000000] * 10,
+        "trade_type": ["bond_borrow"] * 3 + ["other"] * 17
+    }
+    
+    df = pd.DataFrame(sample_data)
+    
+    # Initialize analyzer and run analysis
+    analyzer = CollateralSwapAnalyzer(config)
+    analyzed_df = analyzer.analyze_trades(df)
+    
+    # Display results
+    print("=== ANALYSIS SUMMARY ===")
+    summary = analyzer.get_analysis_summary(analyzed_df)
+    for key, value in summary.items():
+        print(f"{key}: {value}")
+    
+    print("\n=== SAMPLE ANALYZED DATA ===")
+    print(analyzed_df[['trade_id', 'counterparty', 'collateral_swap_flag', 
+                      'collateral_swap_reason', 'sequential_swap_id']].head(10))
+    
+    print("\n=== COLLATERAL SWAPS ONLY ===")
+    swaps_only = analyzer.get_collateral_swaps(analyzed_df)
+    print(f"Found {len(swaps_only)} collateral swaps")
+    
+    print("\n=== SWAPS BY REASON ===")
+    swaps_by_reason = analyzer.get_swaps_by_reason(analyzed_df)
+    for reason, reason_df in swaps_by_reason.items():
+        print(f"{reason}: {len(reason_df)} trades")
+    
+    print("\n=== NON-SWAPS BY EXCLUSION REASON ===")
+    non_swaps_by_reason = analyzer.get_swaps_by_reason(analyzed_df, invert=True)
+    for reason, reason_df in non_swaps_by_reason.items():
+        print(f"{reason}: {len(reason_df)} trades")
