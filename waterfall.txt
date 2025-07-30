@@ -1,308 +1,840 @@
 import pandas as pd
 import numpy as np
 from enum import Enum
-from typing import List, Dict, Tuple, NamedTuple, Optional
+from collections import namedtuple
+from typing import Dict, List, Optional, Tuple, Any
 
-
+# Enumerations
 class TradeType(Enum):
-    BOND_BORROW = "bond_borrow"
-    BOND_LEND = "bond_lend"
-    OTHER = "other"
+    BOND_BORROW = 'BB'
+    BOND_LEND = 'BL'
+    REPO = 'REP'
+    REVERSE_REPO = 'REV'
+    TRI_PARTY_REPO = 'TP'
+    TRI_PARTY_REVERSE = 'TR'
+    TRI_PARTY_REPO_ALT = 'TPR'
+    TRI_PARTY_REVERSE_ALT = 'TRV'
+    TRI_PARTY_BOND = 'TPB'
+    TRI_PARTY_LEND = 'TPL'
 
+class SwapType(Enum):
+    UPGRADE = 'UPGRADE'
+    DOWNGRADE = 'DOWNGRADE'
+    NEUTRAL = 'NEUTRAL'
 
-class BookAccountingTreatment(Enum):
-    ACA = "ACA"
-    OTHER = "OTHER"
+class TransactionType(Enum):
+    FINANCING = 'FINANCING'
+    FUNDING = 'FUNDING'
+    COLLATERAL_SWAP = 'COLLATERAL_SWAP'
+    UNSECURED_BOND = 'UNSECURED_BOND'
 
+class HqlaStatus(Enum):
+    LEVEL_1 = 1
+    LEVEL_2A = 2
+    LEVEL_2B = 3
+    NON_HQLA = 4
 
-class SwapReason(Enum):
-    BOND_CPTY_EXCLUSION = "Bond trade with excluded counterparty"
-    BOOK_CPTY_EXCLUSION = "Trade in excluded book or counterparty"
-    NON_ACA_ACCOUNTING = "Non-ACA accounting treatment"
-    LOW_GROUP_VALUE = "Group market value below threshold"
-    HIGH_GROUP_VALUE = "Group market value above threshold"
+class BondAssetType(Enum):
+    GOVT = 1
+    CORP_SENIOR = 2
+    CORP_JUNIOR = 3
+    ABS_CLO = 4
 
+# Column name enumerations for input data
+class InputColumns(Enum):
+    TRADE_ID = 'trade_id'
+    BOOKING_SYSTEM = 'booking_system'
+    TRADE_TYPE = 'trade_type'
+    COUNTERPARTY = 'counterparty'
+    COUNTERPARTY_CODE = 'counterparty_code'
+    NOTIONAL = 'notional'
+    CURRENCY = 'currency'
+    MARKET_PRICE = 'market_price'
+    MATURITY_DATE = 'maturity_date'
+    CONTRACT_ID = 'contract_id'
+    BOOKING_COLLATERAL_SWAP_FLAG = 'booking_collateral_swap_flag'
+    IS_SECURED = 'is_secured'
+    FX_RATE = 'fx_rate'
+    START_CASH = 'start_cash'
+    BOOK_ACCOUNTING_TREATMENT = 'book_accounting_treatment'
+    HQLA_STATUS = 'hqla_status'
+    WORST_RATING = 'worst_rating'
+    SP_RATING = 'sp_rating'
+    MOODY_RATING = 'moody_rating'
+    FITCH_RATING = 'fitch_rating'
+    BOND_ASSET_TYPE = 'bond_asset_type'
+    PRDS_CODE = 'prds_code'
 
-class ColumnNames(NamedTuple):
-    trade_id: str = "trade_id"
-    counterparty: str = "counterparty"
-    currency: str = "currency"
-    notional: str = "notional"
-    book: str = "book"
-    book_accounting_treatment: str = "book_accounting_treatment"
-    group_key: str = "group_key"
-    market_value: str = "market_value"
-    trade_type: str = "trade_type"
+# Output column names
+class OutputColumns(Enum):
+    COLLATERAL_SWAP_INDICATOR = 'collateral_swap_indicator'
+    TRADE_GROUP_SYNTHETIC_KEY = 'trade_group_synthetic_key'
+    COLLATERAL_SWAP_ID = 'collateral_swap_id'
+    COLLATERAL_SWAP_TYPE = 'collateral_swap_type'
+    TRANSACTION_TYPE = 'transaction_type'
+    COLLATERAL_SWAP_CONSTRUCTION = 'collateral_swap_construction'
     
-    # Output columns
-    rule_1: str = "rule_1"
-    rule_2: str = "rule_2"
-    rule_3: str = "rule_3"
-    rule_4: str = "rule_4"
-    collateral_swap_flag: str = "collateral_swap_flag"
-    collateral_swap_reason: str = "collateral_swap_reason"
-    sequential_swap_id: str = "sequential_swap_id"
+    # Intermediate calculation columns
+    TRADE_DIRECTION = 'trade_direction'
+    DIRECTIONAL_MARKET_VALUE = 'directional_market_value'
+    SYNTHETIC_KEY_DESK = 'synthetic_key_desk'
+    SYNTHETIC_KEY_CONTRACT = 'synthetic_key_contract'
+    SYNTHETIC_KEY_SECURED = 'synthetic_key_secured'
+    GROUP_SUM = 'group_sum'
+    GROUP_SUM_CONTRACT = 'group_sum_contract'
+    HIERARCHY_SCORE = 'hierarchy_score'
+    COLLATERAL_DIRECTION = 'collateral_direction'
+    
+    # Debug columns
+    DEBUG_APPROACH_USED = 'debug_approach_used'
+    DEBUG_RULE_APPLIED = 'debug_rule_applied'
+    DEBUG_MARKET_VALUE = 'debug_market_value'
+    DEBUG_GROUP_SUM = 'debug_group_sum'
+    DEBUG_HIERARCHY_SCORE = 'debug_hierarchy_score'
 
+# PRDS Code enumeration
+class PrdsCode(Enum):
+    REPO = 'REPO'
+    BOND = 'BOND'
+    SECURITIES_LENDING = 'SL'
 
-class CollateralSwapConfig:
+# Configuration structures
+ApproachConfig = namedtuple('ApproachConfig', [
+    'enabled', 'desk_logic', 'contract_id', 'secured_flag'
+])
+
+HierarchyConfig = namedtuple('HierarchyConfig', [
+    'hqla_enabled', 'rating_enabled', 'asset_type_enabled', 'use_worst_rating_field'
+])
+
+ThresholdConfig = namedtuple('ThresholdConfig', [
+    'market_value_threshold'
+])
+
+WaterfallRules = namedtuple('WaterfallRules', [
+    'excluded_counterparties', 'excluded_books', 'excluded_counterparty_codes',
+    'accounting_treatment_threshold'
+])
+
+DebugConfig = namedtuple('DebugConfig', [
+    'enable_debug_columns', 'verbose_logging'
+])
+
+# Column mapping configuration
+ColumnMapping = namedtuple('ColumnMapping', [
+    'trade_id', 'booking_system', 'trade_type', 'counterparty', 'counterparty_code',
+    'notional', 'currency', 'market_price', 'maturity_date', 'contract_id',
+    'booking_collateral_swap_flag', 'is_secured', 'fx_rate', 'start_cash',
+    'book_accounting_treatment', 'hqla_status', 'worst_rating', 'sp_rating',
+    'moody_rating', 'fitch_rating', 'bond_asset_type', 'prds_code'
+])
+
+class CollateralSwapEngine:
+    """
+    A comprehensive collateral swap identification and classification engine
+    supporting multiple rule-based approaches with configurable hierarchy logic.
+    """
+    
     def __init__(self, 
-                 excluded_counterparties: List[str],
-                 excluded_books: List[str],
-                 excluded_counterparties_book_rule: List[str],
-                 group_value_threshold: float = 1e6):
-        self.excluded_counterparties = excluded_counterparties
-        self.excluded_books = excluded_books
-        self.excluded_counterparties_book_rule = excluded_counterparties_book_rule
-        self.group_value_threshold = group_value_threshold
-
-
-class CollateralSwapAnalyzer:
-    """
-    A class to analyze trade data and determine collateral swap indicators using waterfall logic.
-    """
+                 approach_config: ApproachConfig,
+                 hierarchy_config: HierarchyConfig,
+                 threshold_config: ThresholdConfig,
+                 waterfall_rules: WaterfallRules,
+                 debug_config: DebugConfig,
+                 column_mapping: ColumnMapping):
+        
+        self.approach_config = approach_config
+        self.hierarchy_config = hierarchy_config
+        self.threshold_config = threshold_config
+        self.waterfall_rules = waterfall_rules
+        self.debug_config = debug_config
+        self.column_mapping = column_mapping
+        
+        # Valid trade type combinations for collateral swaps
+        self.valid_swap_combinations = {
+            frozenset([TradeType.BOND_BORROW.value, TradeType.BOND_LEND.value]),
+            frozenset([TradeType.REPO.value, TradeType.REVERSE_REPO.value]),
+            frozenset([TradeType.TRI_PARTY_REPO.value, TradeType.TRI_PARTY_REVERSE.value]),
+            frozenset([TradeType.TRI_PARTY_REPO_ALT.value, TradeType.TRI_PARTY_REVERSE_ALT.value]),
+            frozenset([TradeType.TRI_PARTY_BOND.value, TradeType.TRI_PARTY_LEND.value])
+        }
+        
+        # Rating mappings (higher score = worse rating)
+        self.rating_scores = {
+            'AAA': 1, 'AA+': 2, 'AA': 3, 'AA-': 4,
+            'A+': 5, 'A': 6, 'A-': 7,
+            'BBB+': 8, 'BBB': 9, 'BBB-': 10,
+            'BB+': 11, 'BB': 12, 'BB-': 13,
+            'B+': 14, 'B': 15, 'B-': 16,
+            'CCC+': 17, 'CCC': 18, 'CCC-': 19,
+            'CC': 20, 'C': 21, 'D': 22
+        }
+        
+        # Trade types that involve cash (repos)
+        self.cash_based_trade_types = {
+            TradeType.REPO.value, TradeType.REVERSE_REPO.value,
+            TradeType.TRI_PARTY_REPO.value, TradeType.TRI_PARTY_REVERSE.value,
+            TradeType.TRI_PARTY_REPO_ALT.value, TradeType.TRI_PARTY_REVERSE_ALT.value
+        }
+        
+        # Trade types that don't involve cash (bond borrow/lend)
+        self.non_cash_trade_types = {
+            TradeType.BOND_BORROW.value, TradeType.BOND_LEND.value,
+            TradeType.TRI_PARTY_BOND.value, TradeType.TRI_PARTY_LEND.value
+        }
+        
+        self.swap_counter = 0
     
-    def __init__(self, config: CollateralSwapConfig):
-        self.config = config
-        self.cols = ColumnNames()
-        
-    def analyze_trades(self, df: pd.DataFrame) -> pd.DataFrame:
+    def process_trades(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Apply waterfall logic to determine collateral swap indicators.
-        
-        Args:
-            df: DataFrame with trade data
-            
-        Returns:
-            DataFrame with additional columns for collateral swap analysis
+        Main processing function that applies the enabled identification approaches
+        and classification logic to the trade dataset.
         """
-        # Create a copy to avoid modifying original data
         result_df = df.copy()
         
-        # Calculate group market value sums
-        group_mv_sums = result_df.groupby(self.cols.group_key)[self.cols.market_value].sum()
-        result_df['group_mv_sum'] = result_df[self.cols.group_key].map(group_mv_sums)
+        # Initialize result columns
+        result_df = self._initialize_result_columns(result_df)
         
-        # Initialize debug columns
-        result_df[self.cols.rule_1] = False
-        result_df[self.cols.rule_2] = False
-        result_df[self.cols.rule_3] = False
-        result_df[self.cols.rule_4] = False
+        # Apply enabled approaches
+        if self.approach_config.desk_logic:
+            result_df = self._apply_desk_logic_approach(result_df)
         
-        # Rule 1: Bond trade with excluded counterparty
-        rule_1_condition = (
-            (result_df[self.cols.counterparty].isin(self.config.excluded_counterparties)) &
-            (result_df[self.cols.trade_type].isin([TradeType.BOND_BORROW.value, TradeType.BOND_LEND.value]))
-        )
-        result_df[self.cols.rule_1] = rule_1_condition
+        if self.approach_config.contract_id:
+            result_df = self._apply_contract_id_approach(result_df)
         
-        # Rule 2: Excluded book or counterparty
-        rule_2_condition = (
-            (result_df[self.cols.book].isin(self.config.excluded_books)) |
-            (result_df[self.cols.counterparty].isin(self.config.excluded_counterparties_book_rule))
-        ) & (~rule_1_condition)  # Only apply if rule 1 didn't already exclude
-        result_df[self.cols.rule_2] = rule_2_condition
+        if self.approach_config.secured_flag:
+            result_df = self._apply_secured_flag_approach(result_df)
         
-        # Rule 3: Non-ACA accounting treatment
-        rule_3_condition = (
-            (result_df[self.cols.book_accounting_treatment] != BookAccountingTreatment.ACA.value) &
-            (~rule_1_condition) & (~rule_2_condition)
-        )
-        result_df[self.cols.rule_3] = rule_3_condition
+        # Apply swap type classification for identified swaps
+        result_df = self._classify_swap_types(result_df)
         
-        # Rule 4: Group market value threshold
-        rule_4_low_condition = (
-            (result_df['group_mv_sum'] < self.config.group_value_threshold) &
-            (~rule_1_condition) & (~rule_2_condition) & (~rule_3_condition)
-        )
-        rule_4_high_condition = (
-            (result_df['group_mv_sum'] >= self.config.group_value_threshold) &
-            (~rule_1_condition) & (~rule_2_condition) & (~rule_3_condition)
-        )
-        result_df[self.cols.rule_4] = rule_4_low_condition | rule_4_high_condition
-        
-        # Apply waterfall logic using numpy.select
-        conditions = [
-            rule_1_condition,
-            rule_2_condition,
-            rule_3_condition,
-            rule_4_low_condition,
-            rule_4_high_condition
-        ]
-        
-        choices_flag = [False, False, True, True, False]
-        choices_reason = [
-            SwapReason.BOND_CPTY_EXCLUSION.value,
-            SwapReason.BOOK_CPTY_EXCLUSION.value,
-            SwapReason.NON_ACA_ACCOUNTING.value,
-            SwapReason.LOW_GROUP_VALUE.value,
-            SwapReason.HIGH_GROUP_VALUE.value
-        ]
-        
-        result_df[self.cols.collateral_swap_flag] = np.select(conditions, choices_flag, default=False)
-        result_df[self.cols.collateral_swap_reason] = np.select(conditions, choices_reason, default="No rule applied")
-        
-        # Create sequential swap ID for collateral swaps only
-        swap_mask = result_df[self.cols.collateral_swap_flag]
-        result_df[self.cols.sequential_swap_id] = "0"  # Initialize as string to avoid dtype issues
-        
-        if swap_mask.any():
-            # Create unique swap groups and assign sequential IDs
-            swap_df = result_df[swap_mask].copy()
-            unique_groups = swap_df[self.cols.group_key].unique()
-            group_to_id = {group: f"{i+1}_{group}" for i, group in enumerate(unique_groups)}
-            
-            result_df.loc[swap_mask, self.cols.sequential_swap_id] = (
-                result_df.loc[swap_mask, self.cols.group_key].map(group_to_id)
-            )
-        
-        # Clean up temporary column
-        result_df.drop('group_mv_sum', axis=1, inplace=True)
+        # Apply transaction type classification
+        result_df = self._classify_transaction_types(result_df)
         
         return result_df
     
-    def get_collateral_swaps(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Returns only collateral swap trades ordered by sequential swap ID.
+    def _initialize_result_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Initialize all result columns with default values."""
+        df[OutputColumns.COLLATERAL_SWAP_INDICATOR.value] = False
+        df[OutputColumns.TRADE_GROUP_SYNTHETIC_KEY.value] = ''
+        df[OutputColumns.COLLATERAL_SWAP_ID.value] = 0
+        df[OutputColumns.COLLATERAL_SWAP_TYPE.value] = SwapType.NEUTRAL.value
+        df[OutputColumns.TRANSACTION_TYPE.value] = TransactionType.FINANCING.value
+        df[OutputColumns.COLLATERAL_SWAP_CONSTRUCTION.value] = ''
         
-        Args:
-            df: Analyzed DataFrame from analyze_trades()
-            
-        Returns:
-            DataFrame containing only collateral swap trades
-        """
-        swap_df = df[df[self.cols.collateral_swap_flag]].copy()
-        if not swap_df.empty:
-            # Sort by sequential swap ID (extract numeric part for proper sorting)
-            swap_df['_sort_key'] = swap_df[self.cols.sequential_swap_id].str.extract(r'(\d+)').astype(int)
-            swap_df = swap_df.sort_values('_sort_key').drop('_sort_key', axis=1)
-        return swap_df
+        if self.debug_config.enable_debug_columns:
+            df[OutputColumns.DEBUG_APPROACH_USED.value] = ''
+            df[OutputColumns.DEBUG_RULE_APPLIED.value] = ''
+            df[OutputColumns.DEBUG_MARKET_VALUE.value] = 0.0
+            df[OutputColumns.DEBUG_GROUP_SUM.value] = 0.0
+            df[OutputColumns.DEBUG_HIERARCHY_SCORE.value] = 0.0
+        
+        return df
     
-    def get_swaps_by_reason(self, df: pd.DataFrame, invert: bool = False) -> Dict[str, pd.DataFrame]:
+    def _set_swap_construction(self, df: pd.DataFrame, mask: pd.Series, group_key_col: str) -> pd.DataFrame:
         """
-        Returns separate DataFrames for collateral swaps split by determination reason.
+        Set the collateral swap construction based on trade type combinations within each group.
+        """
+        trade_type_col = self.column_mapping.trade_type
         
-        Args:
-            df: Analyzed DataFrame from analyze_trades()
-            invert: If True, returns non-collateral swaps split by exclusion reason
+        # Define trade type combination mappings
+        construction_mapping = {
+            frozenset([TradeType.BOND_BORROW.value, TradeType.BOND_LEND.value]): 'BB+BL',
+            frozenset([TradeType.REPO.value, TradeType.REVERSE_REPO.value]): 'REP+REV',
+            frozenset([TradeType.TRI_PARTY_REPO.value, TradeType.TRI_PARTY_REVERSE.value]): 'TP+TR',
+            frozenset([TradeType.TRI_PARTY_REPO_ALT.value, TradeType.TRI_PARTY_REVERSE_ALT.value]): 'TPR+TRV',
+            frozenset([TradeType.TRI_PARTY_BOND.value, TradeType.TRI_PARTY_LEND.value]): 'TPB+TPL'
+        }
+        
+        # Process each group to determine construction
+        if mask.any():
+            for group_key in df.loc[mask, group_key_col].unique():
+                group_mask = (df[group_key_col] == group_key) & mask
+                
+                # Get unique trade types in this group
+                trade_types_in_group = set(df.loc[group_mask, trade_type_col].unique())
+                trade_types_frozen = frozenset(trade_types_in_group)
+                
+                # Find matching construction pattern
+                construction = 'UNKNOWN'
+                for pattern, construction_name in construction_mapping.items():
+                    if pattern.issubset(trade_types_frozen):
+                        construction = construction_name
+                        break
+                
+                # If no exact match, create a descriptive name
+                if construction == 'UNKNOWN' and len(trade_types_in_group) > 1:
+                    construction = '+'.join(sorted(trade_types_in_group))
+                elif construction == 'UNKNOWN' and len(trade_types_in_group) == 1:
+                    construction = list(trade_types_in_group)[0] + '_SINGLE'
+                
+                df.loc[group_mask, OutputColumns.COLLATERAL_SWAP_CONSTRUCTION.value] = construction
+                
+        return df
+    
+    def _calculate_directional_market_value(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate EUR directional market value based on PRDS code and trade type."""
+        df = df.copy()
+        
+        # Get mapped column names
+        trade_type_col = self.column_mapping.trade_type
+        notional_col = self.column_mapping.notional
+        market_price_col = self.column_mapping.market_price
+        fx_rate_col = self.column_mapping.fx_rate
+        start_cash_col = self.column_mapping.start_cash
+        prds_code_col = self.column_mapping.prds_code
+        
+        # Determine trade direction based on trade type
+        repo_types = [TradeType.REPO.value, TradeType.TRI_PARTY_REPO.value, 
+                     TradeType.TRI_PARTY_REPO_ALT.value, TradeType.TRI_PARTY_BOND.value]
+        reverse_repo_types = [TradeType.REVERSE_REPO.value, TradeType.TRI_PARTY_REVERSE.value,
+                             TradeType.TRI_PARTY_REVERSE_ALT.value, TradeType.TRI_PARTY_LEND.value]
+        bond_borrow_types = [TradeType.BOND_BORROW.value]
+        bond_lend_types = [TradeType.BOND_LEND.value]
+        
+        # Trade direction: 1 for giving collateral, -1 for receiving
+        df[OutputColumns.TRADE_DIRECTION.value] = np.select([
+            df[trade_type_col].isin(repo_types + bond_lend_types),
+            df[trade_type_col].isin(reverse_repo_types + bond_borrow_types)
+        ], [1, -1], default=0)
+        
+        # Get FX rate column (default to 1.0 if not available)
+        fx_rate = df[fx_rate_col] if fx_rate_col and fx_rate_col in df.columns else 1.0
+        
+        # Calculate directional market value based on PRDS code and trade type
+        is_cash_based = (
+            df[trade_type_col].isin(self.cash_based_trade_types) |
+            (df[prds_code_col] == PrdsCode.REPO.value) if prds_code_col and prds_code_col in df.columns else 
+            df[trade_type_col].isin(self.cash_based_trade_types)
+        )
+        
+        # Method 1: For non-cash based (bond borrow/lend) - Notional * Price * FX * Direction
+        method1 = (df[notional_col] * df[market_price_col] * fx_rate * 
+                  df[OutputColumns.TRADE_DIRECTION.value])
+        
+        # Method 2: For cash based (repos) - StartCash * Direction * Market Price * FX
+        if start_cash_col and start_cash_col in df.columns:
+            method2 = (df[start_cash_col] * df[OutputColumns.TRADE_DIRECTION.value] * 
+                      df[market_price_col] * fx_rate)
             
-        Returns:
-            Dictionary with reason as key and filtered DataFrame as value
-        """
-        if invert:
-            # Return non-swaps by exclusion reason
-            non_swap_df = df[~df[self.cols.collateral_swap_flag]].copy()
-            reasons = non_swap_df[self.cols.collateral_swap_reason].unique()
+            # Use method2 for cash-based trades where start_cash is available, otherwise method1
+            df[OutputColumns.DIRECTIONAL_MARKET_VALUE.value] = np.where(
+                is_cash_based & df[start_cash_col].notna(), 
+                method2, 
+                method1
+            )
         else:
-            # Return swaps by determination reason
-            swap_df = df[df[self.cols.collateral_swap_flag]].copy()
-            reasons = swap_df[self.cols.collateral_swap_reason].unique()
+            # If start_cash not available, use method1 for all
+            df[OutputColumns.DIRECTIONAL_MARKET_VALUE.value] = method1
         
-        result_dict = {}
+        if self.debug_config.enable_debug_columns:
+            df[OutputColumns.DEBUG_MARKET_VALUE.value] = df[OutputColumns.DIRECTIONAL_MARKET_VALUE.value]
         
-        for reason in reasons:
-            if invert:
-                filtered_df = df[
-                    (~df[self.cols.collateral_swap_flag]) & 
-                    (df[self.cols.collateral_swap_reason] == reason)
-                ].copy()
-            else:
-                filtered_df = df[
-                    (df[self.cols.collateral_swap_flag]) & 
-                    (df[self.cols.collateral_swap_reason] == reason)
-                ].copy()
-            
-            if not filtered_df.empty and not invert:
-                # Sort swaps by sequential swap ID
-                filtered_df['_sort_key'] = filtered_df[self.cols.sequential_swap_id].str.extract(r'(\d+)').astype(int)
-                filtered_df = filtered_df.sort_values('_sort_key').drop('_sort_key', axis=1)
-            
-            result_dict[reason] = filtered_df
-        
-        return result_dict
+        return df
     
-    def get_analysis_summary(self, df: pd.DataFrame) -> Dict[str, any]:
-        """
-        Returns a summary of the collateral swap analysis.
+    def _apply_desk_logic_approach(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply Approach 1: Desk logic waterfall approach using np.select."""
+        df = self._calculate_directional_market_value(df)
         
-        Args:
-            df: Analyzed DataFrame from analyze_trades()
+        # Get mapped column names
+        counterparty_code_col = self.column_mapping.counterparty_code
+        maturity_date_col = self.column_mapping.maturity_date
+        trade_type_col = self.column_mapping.trade_type
+        booking_system_col = self.column_mapping.booking_system
+        book_accounting_treatment_col = self.column_mapping.book_accounting_treatment
+        
+        # Create synthetic key for grouping
+        df[OutputColumns.SYNTHETIC_KEY_DESK.value] = (
+            df[counterparty_code_col].astype(str) + '_' + 
+            df[maturity_date_col].astype(str)
+        )
+        
+        # Calculate group sums
+        group_sums = df.groupby(OutputColumns.SYNTHETIC_KEY_DESK.value)[OutputColumns.DIRECTIONAL_MARKET_VALUE.value].sum()
+        df[OutputColumns.GROUP_SUM.value] = df[OutputColumns.SYNTHETIC_KEY_DESK.value].map(group_sums)
+        
+        # Apply waterfall logic using numpy.select - WATERFALL APPROACH
+        # NOTE: Conditions are NOT mutually exclusive - multiple conditions can be true
+        # for the same trade. np.select() returns result for FIRST matching condition.
+        # Each condition is checked in order, first match wins (true waterfall behavior)
+        conditions = [
+            # RULE 1: Excluded counterparties with bond borrow/lend -> NOT a collateral swap
+            (df[counterparty_code_col].isin(self.waterfall_rules.excluded_counterparties) & 
+             df[trade_type_col].isin([TradeType.BOND_BORROW.value, TradeType.BOND_LEND.value])),
             
-        Returns:
-            Dictionary with analysis summary statistics
-        """
-        total_trades = len(df)
-        total_swaps = df[self.cols.collateral_swap_flag].sum()
+            # RULE 2: Excluded books or counterparties -> NOT a collateral swap
+            (df[booking_system_col].isin(self.waterfall_rules.excluded_books) | 
+             df[counterparty_code_col].isin(self.waterfall_rules.excluded_counterparty_codes)),
+            
+            # RULE 3: Accounting treatment check -> IS a collateral swap
+            (df[book_accounting_treatment_col] != self.waterfall_rules.accounting_treatment_threshold) 
+            if book_accounting_treatment_col and book_accounting_treatment_col in df.columns 
+            else False,
+            
+            # RULE 4: Market value threshold check -> IS a collateral swap
+            (df[OutputColumns.GROUP_SUM.value] < self.threshold_config.market_value_threshold)
+        ]
         
-        # Count by reason
-        reason_counts = df[self.cols.collateral_swap_reason].value_counts().to_dict()
+        # Choices corresponding to conditions (True = is collateral swap, False = is not)
+        choices = [False, False, True, True]
+        default = False
         
-        # Count by rule application
-        rule_counts = {
-            "Rule 1 (Bond + Counterparty)": int(df[self.cols.rule_1].sum()),
-            "Rule 2 (Book/Counterparty)": int(df[self.cols.rule_2].sum()),
-            "Rule 3 (Non-ACA Accounting)": int(df[self.cols.rule_3].sum()),
-            "Rule 4 (Group Value Threshold)": int(df[self.cols.rule_4].sum())
-        }
+        # Apply waterfall logic - first matching condition determines the result
+        desk_swap_flag = np.select(conditions, choices, default=default)
         
-        return {
-            "total_trades": total_trades,
-            "total_collateral_swaps": int(total_swaps),
-            "collateral_swap_percentage": f"{(total_swaps/total_trades)*100:.2f}%",
-            "reason_breakdown": reason_counts,
-            "rule_application_counts": rule_counts
-        }
+        # Update results for desk logic approach
+        mask = desk_swap_flag
+        df.loc[mask, OutputColumns.COLLATERAL_SWAP_INDICATOR.value] = True
+        df.loc[mask, OutputColumns.TRADE_GROUP_SYNTHETIC_KEY.value] = df.loc[mask, OutputColumns.SYNTHETIC_KEY_DESK.value]
+        
+        # Set construction based on trade type combinations in each group
+        df = self._set_swap_construction(df, mask, OutputColumns.SYNTHETIC_KEY_DESK.value)
+        
+        if self.debug_config.enable_debug_columns:
+            df.loc[mask, OutputColumns.DEBUG_APPROACH_USED.value] = 'DESK_LOGIC'
+            df.loc[mask, OutputColumns.DEBUG_GROUP_SUM.value] = df.loc[mask, OutputColumns.GROUP_SUM.value]
+            
+            # Debug rule applied - show which rule was triggered
+            rule_applied = np.select(conditions, 
+                                   ['RULE1_EXCLUDED_CPTY', 'RULE2_EXCLUDED_BOOK', 
+                                    'RULE3_ACCOUNTING', 'RULE4_THRESHOLD'], 
+                                   default='NO_RULE')
+            df.loc[mask, OutputColumns.DEBUG_RULE_APPLIED.value] = rule_applied[mask]
+        
+        return df
+    
+    def _apply_contract_id_approach(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply Approach 2: Contract ID based approach."""
+        df = self._calculate_directional_market_value(df)
+        
+        # Get mapped column names
+        counterparty_code_col = self.column_mapping.counterparty_code
+        maturity_date_col = self.column_mapping.maturity_date
+        contract_id_col = self.column_mapping.contract_id
+        trade_type_col = self.column_mapping.trade_type
+        
+        # Create synthetic key using contract_id
+        df[OutputColumns.SYNTHETIC_KEY_CONTRACT.value] = (
+            df[counterparty_code_col].astype(str) + '_' + 
+            df[maturity_date_col].astype(str) + '_' + 
+            df[contract_id_col].astype(str) + '_' + 
+            df[trade_type_col].astype(str)
+        )
+        
+        # Calculate group sums
+        group_sums = df.groupby(OutputColumns.SYNTHETIC_KEY_CONTRACT.value)[OutputColumns.DIRECTIONAL_MARKET_VALUE.value].sum()
+        df[OutputColumns.GROUP_SUM_CONTRACT.value] = df[OutputColumns.SYNTHETIC_KEY_CONTRACT.value].map(group_sums)
+        
+        # Apply threshold logic
+        contract_swap_flag = (
+            (np.abs(df[OutputColumns.GROUP_SUM_CONTRACT.value]) < self.threshold_config.market_value_threshold) & 
+            (df[contract_id_col].notna())
+        )
+        
+        # Update results for contract ID approach (only if not already identified by desk logic)
+        mask = contract_swap_flag & ~df[OutputColumns.COLLATERAL_SWAP_INDICATOR.value]
+        df.loc[mask, OutputColumns.COLLATERAL_SWAP_INDICATOR.value] = True
+        df.loc[mask, OutputColumns.TRADE_GROUP_SYNTHETIC_KEY.value] = df.loc[mask, OutputColumns.SYNTHETIC_KEY_CONTRACT.value]
+        
+        # Set construction based on trade type combinations in each group
+        df = self._set_swap_construction(df, mask, OutputColumns.SYNTHETIC_KEY_CONTRACT.value)
+        
+        if self.debug_config.enable_debug_columns:
+            df.loc[mask, OutputColumns.DEBUG_APPROACH_USED.value] = 'CONTRACT_ID'
+            df.loc[mask, OutputColumns.DEBUG_GROUP_SUM.value] = df.loc[mask, OutputColumns.GROUP_SUM_CONTRACT.value]
+            df.loc[mask, OutputColumns.DEBUG_RULE_APPLIED.value] = 'THRESHOLD_CHECK'
+        
+        return df
+    
+    def _apply_secured_flag_approach(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply Approach 3: Secured flag based approach."""
+        # Get mapped column names
+        counterparty_code_col = self.column_mapping.counterparty_code
+        maturity_date_col = self.column_mapping.maturity_date
+        trade_type_col = self.column_mapping.trade_type
+        booking_collateral_swap_flag_col = self.column_mapping.booking_collateral_swap_flag
+        is_secured_col = self.column_mapping.is_secured
+        
+        # Create synthetic key for secured flag approach
+        df[OutputColumns.SYNTHETIC_KEY_SECURED.value] = (
+            df[counterparty_code_col].astype(str) + '_' + 
+            df[maturity_date_col].astype(str)
+        )
+        
+        # Repo types logic with collateral swap flag
+        repo_types = [TradeType.REPO.value, TradeType.REVERSE_REPO.value, 
+                     TradeType.TRI_PARTY_REPO.value, TradeType.TRI_PARTY_REVERSE.value,
+                     TradeType.TRI_PARTY_REPO_ALT.value, TradeType.TRI_PARTY_REVERSE_ALT.value]
+        
+        bond_types = [TradeType.BOND_BORROW.value, TradeType.BOND_LEND.value]
+        
+        # Apply secured flag logic
+        repo_condition = (
+            df[trade_type_col].isin(repo_types) & 
+            (df[booking_collateral_swap_flag_col] == True) 
+            if booking_collateral_swap_flag_col and booking_collateral_swap_flag_col in df.columns
+            else False
+        )
+        
+        bond_condition = (
+            df[trade_type_col].isin(bond_types) & 
+            (df[is_secured_col] == True)
+            if is_secured_col and is_secured_col in df.columns
+            else False
+        )
+        
+        secured_swap_flag = repo_condition | bond_condition
+        
+        # Update results for secured flag approach (only if not already identified)
+        mask = secured_swap_flag & ~df[OutputColumns.COLLATERAL_SWAP_INDICATOR.value]
+        df.loc[mask, OutputColumns.COLLATERAL_SWAP_INDICATOR.value] = True
+        df.loc[mask, OutputColumns.TRADE_GROUP_SYNTHETIC_KEY.value] = df.loc[mask, OutputColumns.SYNTHETIC_KEY_SECURED.value]
+        
+        # Set construction based on trade type combinations in each group
+        df = self._set_swap_construction(df, mask, OutputColumns.SYNTHETIC_KEY_SECURED.value)
+        
+        if self.debug_config.enable_debug_columns:
+            df.loc[mask, OutputColumns.DEBUG_APPROACH_USED.value] = 'SECURED_FLAG'
+            df.loc[mask, OutputColumns.DEBUG_RULE_APPLIED.value] = np.where(
+                df.loc[mask, trade_type_col].isin(repo_types), 
+                'REPO_COLLATERAL_FLAG', 
+                'BOND_SECURED_FLAG'
+            )
+        
+        return df
+    
+    def _classify_swap_types(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Classify collateral swaps as upgrade, downgrade, or neutral."""
+        # Only process identified collateral swaps
+        swap_mask = df[OutputColumns.COLLATERAL_SWAP_INDICATOR.value] == True
+        
+        if not swap_mask.any():
+            return df
+        
+        # Calculate hierarchy scores
+        df = self._calculate_hierarchy_scores(df)
+        
+        # Get mapped column names
+        trade_type_col = self.column_mapping.trade_type
+        
+        # Group by trade group key and calculate swap types
+        for group_key in df.loc[swap_mask, OutputColumns.TRADE_GROUP_SYNTHETIC_KEY.value].unique():
+            group_mask = (df[OutputColumns.TRADE_GROUP_SYNTHETIC_KEY.value] == group_key) & swap_mask
+            group_df = df.loc[group_mask]
+            
+            if len(group_df) < 2:
+                continue
+            
+            # Determine collateral direction (given vs received)
+            repo_giving_types = [TradeType.REPO.value, TradeType.TRI_PARTY_REPO.value,
+                               TradeType.TRI_PARTY_REPO_ALT.value, TradeType.BOND_LEND.value]
+            
+            df.loc[group_mask, OutputColumns.COLLATERAL_DIRECTION.value] = np.where(
+                df.loc[group_mask, trade_type_col].isin(repo_giving_types), 
+                'GIVING', 
+                'RECEIVING'
+            )
+            
+            # Calculate average scores for given and received collateral
+            giving_mask = group_mask & (df[OutputColumns.COLLATERAL_DIRECTION.value] == 'GIVING')
+            receiving_mask = group_mask & (df[OutputColumns.COLLATERAL_DIRECTION.value] == 'RECEIVING')
+            
+            if giving_mask.any() and receiving_mask.any():
+                avg_given_score = df.loc[giving_mask, OutputColumns.HIERARCHY_SCORE.value].mean()
+                avg_received_score = df.loc[receiving_mask, OutputColumns.HIERARCHY_SCORE.value].mean()
+                
+                # Determine swap type (lower score = higher quality)
+                if avg_given_score < avg_received_score:  # Giving higher quality
+                    swap_type = SwapType.DOWNGRADE.value
+                elif avg_given_score > avg_received_score:  # Giving lower quality
+                    swap_type = SwapType.UPGRADE.value
+                else:
+                    swap_type = SwapType.NEUTRAL.value
+                
+                df.loc[group_mask, OutputColumns.COLLATERAL_SWAP_TYPE.value] = swap_type
+                
+                # Assign sequential swap IDs
+                self.swap_counter += 1
+                df.loc[group_mask, OutputColumns.COLLATERAL_SWAP_ID.value] = self.swap_counter
+        
+        return df
+    
+    def _calculate_hierarchy_scores(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate combined hierarchy scores based on enabled hierarchy layers."""
+        df[OutputColumns.HIERARCHY_SCORE.value] = 0.0
+        
+        # Get mapped column names
+        hqla_status_col = self.column_mapping.hqla_status
+        worst_rating_col = self.column_mapping.worst_rating
+        sp_rating_col = self.column_mapping.sp_rating
+        moody_rating_col = self.column_mapping.moody_rating
+        fitch_rating_col = self.column_mapping.fitch_rating
+        bond_asset_type_col = self.column_mapping.bond_asset_type
+        
+        if self.hierarchy_config.hqla_enabled and hqla_status_col and hqla_status_col in df.columns:
+            hqla_scores = df[hqla_status_col].map({
+                HqlaStatus.LEVEL_1.value: 1,
+                HqlaStatus.LEVEL_2A.value: 2,
+                HqlaStatus.LEVEL_2B.value: 3,
+                HqlaStatus.NON_HQLA.value: 4
+            }).fillna(4)  # Default to worst if missing
+            df[OutputColumns.HIERARCHY_SCORE.value] += hqla_scores
+        
+        if self.hierarchy_config.rating_enabled:
+            if (self.hierarchy_config.use_worst_rating_field and 
+                worst_rating_col and worst_rating_col in df.columns):
+                rating_scores = df[worst_rating_col].map(self.rating_scores).fillna(22)
+            else:
+                # Calculate worst rating from individual rating columns
+                rating_cols = [sp_rating_col, moody_rating_col, fitch_rating_col]
+                available_cols = [col for col in rating_cols if col and col in df.columns]
+                
+                if available_cols:
+                    rating_scores_df = df[available_cols].apply(
+                        lambda x: x.map(self.rating_scores), axis=0
+                    ).fillna(22)
+                    rating_scores = rating_scores_df.max(axis=1)  # Worst (highest) rating
+                else:
+                    rating_scores = pd.Series(22, index=df.index)  # Default worst rating
+            
+            df[OutputColumns.HIERARCHY_SCORE.value] += rating_scores
+        
+        if (self.hierarchy_config.asset_type_enabled and 
+            bond_asset_type_col and bond_asset_type_col in df.columns):
+            asset_type_scores = df[bond_asset_type_col].map({
+                BondAssetType.GOVT.value: 1,
+                BondAssetType.CORP_SENIOR.value: 2,
+                BondAssetType.CORP_JUNIOR.value: 3,
+                BondAssetType.ABS_CLO.value: 4
+            }).fillna(4)  # Default to worst if missing
+            df[OutputColumns.HIERARCHY_SCORE.value] += asset_type_scores
+        
+        if self.debug_config.enable_debug_columns:
+            df[OutputColumns.DEBUG_HIERARCHY_SCORE.value] = df[OutputColumns.HIERARCHY_SCORE.value]
+        
+        return df
+    
+    def _classify_transaction_types(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Classify transactions as financing, funding, collateral swap, or unsecured bond."""
+        # Get mapped column names
+        trade_type_col = self.column_mapping.trade_type
+        is_secured_col = self.column_mapping.is_secured
+        
+        bond_types = [TradeType.BOND_BORROW.value, TradeType.BOND_LEND.value]
+        
+        # Unsecured bond borrow/lend
+        unsecured_condition = (
+            df[trade_type_col].isin(bond_types) &
+            (df[is_secured_col] != True) if is_secured_col and is_secured_col in df.columns
+            else False
+        )
+        df.loc[unsecured_condition, OutputColumns.TRANSACTION_TYPE.value] = TransactionType.UNSECURED_BOND.value
+        
+        # Collateral swaps (already identified)
+        swap_mask = df[OutputColumns.COLLATERAL_SWAP_INDICATOR.value] == True
+        df.loc[swap_mask, OutputColumns.TRANSACTION_TYPE.value] = TransactionType.COLLATERAL_SWAP.value
+        
+        # Remaining repo/reverse repo transactions
+        repo_types = [TradeType.REPO.value, TradeType.TRI_PARTY_REPO.value, 
+                     TradeType.TRI_PARTY_REPO_ALT.value]
+        reverse_repo_types = [TradeType.REVERSE_REPO.value, TradeType.TRI_PARTY_REVERSE.value,
+                             TradeType.TRI_PARTY_REVERSE_ALT.value]
+        
+        remaining_mask = ~(unsecured_condition | swap_mask)
+        
+        df.loc[remaining_mask & df[trade_type_col].isin(repo_types), OutputColumns.TRANSACTION_TYPE.value] = TransactionType.FINANCING.value
+        df.loc[remaining_mask & df[trade_type_col].isin(reverse_repo_types), OutputColumns.TRANSACTION_TYPE.value] = TransactionType.FUNDING.value
+        
+        return df
 
+# Helper function to create default column mapping
+def create_default_column_mapping():
+    """Create default column mapping using standard column names."""
+    return ColumnMapping(
+        trade_id='trade_id',
+        booking_system='booking_system',
+        trade_type='trade_type',
+        counterparty='counterparty',
+        counterparty_code='counterparty_code',
+        notional='notional',
+        currency='currency',
+        market_price='market_price',
+        maturity_date='maturity_date',
+        contract_id='contract_id',
+        booking_collateral_swap_flag='booking_collateral_swap_flag',
+        is_secured='is_secured',
+        fx_rate='fx_rate',
+        start_cash='start_cash',
+        book_accounting_treatment='book_accounting_treatment',
+        hqla_status='hqla_status',
+        worst_rating='worst_rating',
+        sp_rating='sp_rating',
+        moody_rating='moody_rating',
+        fitch_rating='fitch_rating',
+        bond_asset_type='bond_asset_type',
+        prds_code='prds_code'
+    )
 
-# Example usage and testing
-if __name__ == "__main__":
-    # Sample configuration
-    config = CollateralSwapConfig(
-        excluded_counterparties=["CPTY_EXCLUDED_1", "CPTY_EXCLUDED_2"],
-        excluded_books=["BOOK_A"],
-        excluded_counterparties_book_rule=["CPTY_A", "CPTY_B"],
-        group_value_threshold=1e6
+# Example usage and configuration
+def create_default_config():
+    """Create default configuration for the collateral swap engine."""
+    
+    approach_config = ApproachConfig(
+        enabled=True,
+        desk_logic=True,
+        contract_id=True,
+        secured_flag=True
     )
     
-    # Create sample data
+    hierarchy_config = HierarchyConfig(
+        hqla_enabled=True,
+        rating_enabled=True,
+        asset_type_enabled=True,
+        use_worst_rating_field=False
+    )
+    
+    threshold_config = ThresholdConfig(
+        market_value_threshold=1e7
+    )
+    
+    waterfall_rules = WaterfallRules(
+        excluded_counterparties=['CPTY_EXCLUDE_1', 'CPTY_EXCLUDE_2'],
+        excluded_books=['BOOK_A', 'BOOK_B'],
+        excluded_counterparty_codes=['CPTY_A', 'CPTY_B'],
+        accounting_treatment_threshold='ACA'
+    )
+    
+    debug_config = DebugConfig(
+        enable_debug_columns=True,
+        verbose_logging=True
+    )
+    
+    column_mapping = create_default_column_mapping()
+    
+    return approach_config, hierarchy_config, threshold_config, waterfall_rules, debug_config, column_mapping
+
+# Example usage with custom column mapping
+def create_custom_column_mapping_example():
+    """Example of how to create custom column mapping for different dataset column names."""
+    return ColumnMapping(
+        trade_id='TradeID',
+        booking_system='BookingSys',
+        trade_type='TradeType',
+        counterparty='Counterparty',
+        counterparty_code='CptyCode',
+        notional='NotionalAmount',
+        currency='Currency',
+        market_price='Price',
+        maturity_date='MaturityDate',
+        contract_id='ContractID',
+        booking_collateral_swap_flag='CollateralSwapFlag',
+        is_secured='IsSecured',
+        fx_rate='FXRate',
+        start_cash='StartCash',
+        book_accounting_treatment='AccountingTreatment',
+        hqla_status='HQLAStatus',
+        worst_rating='WorstRating',
+        sp_rating='SPRating',
+        moody_rating='MoodyRating',
+        fitch_rating='FitchRating',
+        bond_asset_type='BondAssetType',
+        prds_code='PRDSCode'
+    )
+
+# Example usage
+if __name__ == "__main__":
+    # Create sample data with standard column names
     sample_data = {
-        "trade_id": [f"T{i:04d}" for i in range(1, 21)],
-        "counterparty": ["CPTY_EXCLUDED_1"] * 3 + ["CPTY_A"] * 3 + ["CPTY_C"] * 14,
-        "currency": ["USD"] * 20,
-        "notional": [1000000] * 20,
-        "book": ["BOOK_A"] * 2 + ["BOOK_B"] * 18,
-        "book_accounting_treatment": ["ACA"] * 15 + ["OTHER"] * 5,
-        "group_key": [f"CPTY_EXCLUDED_1_2024-01-01"] * 3 + [f"CPTY_A_2024-01-01"] * 3 + 
-                    [f"CPTY_C_2024-01-01"] * 8 + [f"CPTY_C_2024-02-01"] * 6,
-        "market_value": [500000] * 10 + [2000000] * 10,
-        "trade_type": ["bond_borrow"] * 3 + ["other"] * 17
+        'trade_id': ['T001', 'T002', 'T003', 'T004'],
+        'booking_system': ['SYS1', 'SYS1', 'SYS2', 'SYS2'],
+        'trade_type': ['REP', 'REV', 'BB', 'BL'],
+        'counterparty': ['CPTY1', 'CPTY1', 'CPTY2', 'CPTY2'],
+        'counterparty_code': ['C001', 'C001', 'C002', 'C002'],
+        'notional': [1000000, 1000000, 500000, 500000],
+        'currency': ['EUR', 'EUR', 'USD', 'USD'],
+        'market_price': [1.0, 1.0, 1.1, 1.1],
+        'maturity_date': ['2024-12-31', '2024-12-31', '2024-12-31', '2024-12-31'],
+        'contract_id': ['CNT001', 'CNT001', 'CNT002', 'CNT002'],
+        'booking_collateral_swap_flag': [False, False, False, False],
+        'is_secured': [True, True, False, False],
+        'prds_code': ['REPO', 'REPO', 'BOND', 'BOND'],
+        'start_cash': [1000000, 1000000, None, None]
     }
     
     df = pd.DataFrame(sample_data)
     
-    # Initialize analyzer and run analysis
-    analyzer = CollateralSwapAnalyzer(config)
-    analyzed_df = analyzer.analyze_trades(df)
+    # Create engine with default configuration
+    configs = create_default_config()
+    engine = CollateralSwapEngine(*configs)
     
-    # Display results
-    print("=== ANALYSIS SUMMARY ===")
-    summary = analyzer.get_analysis_summary(analyzed_df)
-    for key, value in summary.items():
-        print(f"{key}: {value}")
+    # Process trades
+    result = engine.process_trades(df)
     
-    print("\n=== SAMPLE ANALYZED DATA ===")
-    print(analyzed_df[['trade_id', 'counterparty', 'collateral_swap_flag', 
-                      'collateral_swap_reason', 'sequential_swap_id']].head(10))
+    print("Processed Results:")
+    output_cols = [
+        'trade_id', 
+        OutputColumns.COLLATERAL_SWAP_INDICATOR.value,
+        OutputColumns.COLLATERAL_SWAP_TYPE.value,
+        OutputColumns.TRANSACTION_TYPE.value,
+        OutputColumns.COLLATERAL_SWAP_CONSTRUCTION.value
+    ]
+    print(result[output_cols].to_string())
     
-    print("\n=== COLLATERAL SWAPS ONLY ===")
-    swaps_only = analyzer.get_collateral_swaps(analyzed_df)
-    print(f"Found {len(swaps_only)} collateral swaps")
+    print("\nDebug Information:")
+    if configs[4].enable_debug_columns:  # debug_config
+        debug_cols = [
+            'trade_id',
+            OutputColumns.DEBUG_APPROACH_USED.value,
+            OutputColumns.DEBUG_RULE_APPLIED.value,
+            OutputColumns.DEBUG_MARKET_VALUE.value,
+            OutputColumns.DEBUG_GROUP_SUM.value
+        ]
+        print(result[debug_cols].to_string())
     
-    print("\n=== SWAPS BY REASON ===")
-    swaps_by_reason = analyzer.get_swaps_by_reason(analyzed_df)
-    for reason, reason_df in swaps_by_reason.items():
-        print(f"{reason}: {len(reason_df)} trades")
+    # Example with custom column mapping
+    print("\n" + "="*50)
+    print("Example with Custom Column Mapping:")
+    print("="*50)
     
-    print("\n=== NON-SWAPS BY EXCLUSION REASON ===")
-    non_swaps_by_reason = analyzer.get_swaps_by_reason(analyzed_df, invert=True)
-    for reason, reason_df in non_swaps_by_reason.items():
-        print(f"{reason}: {len(reason_df)} trades")
+    # Sample data with different column names
+    custom_sample_data = {
+        'TradeID': ['T001', 'T002', 'T003', 'T004'],
+        'BookingSys': ['SYS1', 'SYS1', 'SYS2', 'SYS2'],
+        'TradeType': ['REP', 'REV', 'BB', 'BL'],
+        'Counterparty': ['CPTY1', 'CPTY1', 'CPTY2', 'CPTY2'],
+        'CptyCode': ['C001', 'C001', 'C002', 'C002'],
+        'NotionalAmount': [1000000, 1000000, 500000, 500000],
+        'Currency': ['EUR', 'EUR', 'USD', 'USD'],
+        'Price': [1.0, 1.0, 1.1, 1.1],
+        'MaturityDate': ['2024-12-31', '2024-12-31', '2024-12-31', '2024-12-31'],
+        'ContractID': ['CNT001', 'CNT001', 'CNT002', 'CNT002'],
+        'CollateralSwapFlag': [False, False, False, False],
+        'IsSecured': [True, True, False, False],
+        'PRDSCode': ['REPO', 'REPO', 'BOND', 'BOND'],
+        'StartCash': [1000000, 1000000, None, None]
+    }
+    
+    custom_df = pd.DataFrame(custom_sample_data)
+    
+    # Create custom column mapping
+    custom_column_mapping = create_custom_column_mapping_example()
+    
+    # Create engine with custom column mapping
+    approach_config, hierarchy_config, threshold_config, waterfall_rules, debug_config, _ = create_default_config()
+    custom_engine = CollateralSwapEngine(
+        approach_config, hierarchy_config, threshold_config, 
+        waterfall_rules, debug_config, custom_column_mapping
+    )
+    
+    # Process trades with custom column mapping
+    custom_result = custom_engine.process_trades(custom_df)
+    
+    print("Custom Column Mapping Results:")
+    custom_output_cols = [
+        'TradeID',  # Original column name
+        OutputColumns.COLLATERAL_SWAP_INDICATOR.value,
+        OutputColumns.COLLATERAL_SWAP_TYPE.value,
+        OutputColumns.TRANSACTION_TYPE.value,
+        OutputColumns.COLLATERAL_SWAP_CONSTRUCTION.value
+    ]
+    print(custom_result[custom_output_cols].to_string())
