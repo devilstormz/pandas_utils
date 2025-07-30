@@ -1,0 +1,222 @@
+import pandas as pd
+import numpy as np
+from enum import Enum
+from typing import Dict, Union
+
+class ProductType(Enum):
+    REPO = "repo"
+    REV_REPO = "rev_repo"
+    BOND_BORROW = "bond_borrow"
+    BOND_LEND = "bond_lend"
+
+class TradeType(Enum):
+    REPO = "repo"
+    REV_REPO = "rev_repo"
+    BOND_BORROW = "bond_borrow"
+    BOND_LEND = "bond_lend"
+
+class ColumnNames:
+    # Input columns
+    PRODUCT_TYPE = 'product_type'
+    TRADE_TYPE = 'trade_type'
+    NOTIONAL = 'notional'
+    PRICE = 'price'
+    START_CASH = 'start_cash'
+    MARKET_PRICE = 'market_price'
+    CCY = 'ccy'
+    BOND_CURRENCY = 'bond_currency'
+    
+    # Output columns
+    IS_CASH_BASED = 'is_cash_based'
+    CASH_CCY = 'cash_ccy'
+    SEC_CCY = 'sec_ccy'
+    TRADE_DIRECTION = 'trade_direction'
+    MV_CASH = 'mv_cash'
+    MV_SEC = 'mv_sec'
+    EUR_MV_CASH = 'eur_mv_cash'
+    EUR_MV_SEC = 'eur_mv_sec'
+    EUR_DIRECTIONAL_MV = 'eur_directional_mv'
+    FX_RATE = 'fx_rate'
+
+class TradeDirection:
+    BUY = 1
+    SELL = -1
+
+# Configuration
+CASH_BASED_PRODUCTS = {ProductType.REPO.value, ProductType.REV_REPO.value}
+
+# Trade direction mapping based on trade type
+TRADE_DIRECTION_MAP = {
+    TradeType.REPO.value: TradeDirection.BUY,
+    TradeType.REV_REPO.value: TradeDirection.SELL,
+    TradeType.BOND_BORROW.value: TradeDirection.SELL,
+    TradeType.BOND_LEND.value: TradeDirection.BUY
+}
+
+def get_fx_rates_to_eur() -> Dict[str, float]:
+    """
+    Function to return FX rates to convert to EUR.
+    Replace this with your actual FX rate retrieval logic.
+    """
+    return {
+        'USD': 0.85,
+        'GBP': 1.15,
+        'JPY': 0.0065,
+        'EUR': 1.0,
+        'CHF': 0.95,
+        # Add more currencies as needed
+    }
+
+def calculate_eur_directional_mv(df: pd.DataFrame, fx_rates: Dict[str, float] = None) -> pd.DataFrame:
+    """
+    Calculate EUR directional market value with intermediate columns.
+    
+    Parameters:
+    df: DataFrame with trade data
+    fx_rates: Dictionary of FX rates to EUR (if None, will call get_fx_rates_to_eur())
+    
+    Returns:
+    DataFrame with additional calculated columns
+    """
+    # Create a copy to avoid modifying original DataFrame
+    result_df = df.copy()
+    
+    # Get FX rates if not provided
+    if fx_rates is None:
+        fx_rates = get_fx_rates_to_eur()
+    
+    # Step 1: Flag to indicate if cash based or not
+    result_df[ColumnNames.IS_CASH_BASED] = result_df[ColumnNames.PRODUCT_TYPE].isin(CASH_BASED_PRODUCTS)
+    
+    # Step 2: Set Cash CCY for cash based trades
+    result_df[ColumnNames.CASH_CCY] = np.where(
+        result_df[ColumnNames.IS_CASH_BASED],
+        result_df[ColumnNames.CCY],
+        np.nan
+    )
+    
+    # Step 3: Set SEC CCY for non-cash based trades
+    result_df[ColumnNames.SEC_CCY] = np.where(
+        ~result_df[ColumnNames.IS_CASH_BASED],
+        result_df[ColumnNames.BOND_CURRENCY],
+        np.nan
+    )
+    
+    # Step 4: Map trade direction based on trade type
+    result_df[ColumnNames.TRADE_DIRECTION] = result_df[ColumnNames.TRADE_TYPE].map(TRADE_DIRECTION_MAP)
+    
+    # Step 5: Create MV Cash and MV Sec columns
+    # MV Cash (for cash based trades)
+    result_df[ColumnNames.MV_CASH] = np.where(
+        result_df[ColumnNames.IS_CASH_BASED],
+        result_df[ColumnNames.START_CASH] * result_df[ColumnNames.TRADE_DIRECTION] * result_df[ColumnNames.MARKET_PRICE],
+        0
+    )
+    
+    # MV Sec (for non-cash based trades)
+    result_df[ColumnNames.MV_SEC] = np.where(
+        ~result_df[ColumnNames.IS_CASH_BASED],
+        result_df[ColumnNames.NOTIONAL] * result_df[ColumnNames.PRICE] * result_df[ColumnNames.TRADE_DIRECTION],
+        0
+    )
+    
+    # Step 6: Get FX rates for conversion
+    # For cash based trades, use Cash CCY
+    cash_fx_rates = result_df[ColumnNames.CASH_CCY].map(fx_rates).fillna(1.0)
+    
+    # For non-cash based trades, use SEC CCY
+    sec_fx_rates = result_df[ColumnNames.SEC_CCY].map(fx_rates).fillna(1.0)
+    
+    # Store FX rates used for transparency
+    result_df[ColumnNames.FX_RATE] = np.where(
+        result_df[ColumnNames.IS_CASH_BASED],
+        cash_fx_rates,
+        sec_fx_rates
+    )
+    
+    # Step 7: Create EUR MV Cash and EUR MV Sec columns
+    # EUR MV Cash (convert MV Cash to EUR)
+    result_df[ColumnNames.EUR_MV_CASH] = np.where(
+        result_df[ColumnNames.IS_CASH_BASED],
+        result_df[ColumnNames.MV_CASH] * cash_fx_rates,
+        0
+    )
+    
+    # EUR MV Sec (convert MV Sec to EUR)
+    result_df[ColumnNames.EUR_MV_SEC] = np.where(
+        ~result_df[ColumnNames.IS_CASH_BASED],
+        result_df[ColumnNames.MV_SEC] * sec_fx_rates,
+        0
+    )
+    
+    # Step 8: Calculate final EUR Directional Market Value
+    result_df[ColumnNames.EUR_DIRECTIONAL_MV] = (
+        result_df[ColumnNames.EUR_MV_CASH] + result_df[ColumnNames.EUR_MV_SEC]
+    )
+    
+    return result_df
+
+def validate_input_data(df: pd.DataFrame) -> None:
+    """
+    Validate that the input DataFrame has all required columns.
+    """
+    required_columns = [
+        ColumnNames.PRODUCT_TYPE,
+        ColumnNames.TRADE_TYPE,
+        ColumnNames.NOTIONAL,
+        ColumnNames.PRICE,
+        ColumnNames.START_CASH,
+        ColumnNames.MARKET_PRICE,
+        ColumnNames.CCY,
+        ColumnNames.BOND_CURRENCY
+    ]
+    
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Missing required columns: {missing_columns}")
+    
+    # Check for valid trade types
+    valid_trade_types = set(TRADE_DIRECTION_MAP.keys())
+    invalid_trade_types = set(df[ColumnNames.TRADE_TYPE].unique()) - valid_trade_types
+    if invalid_trade_types:
+        raise ValueError(f"Invalid trade types found: {invalid_trade_types}")
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Sample data for testing
+    sample_data = {
+        ColumnNames.PRODUCT_TYPE: ['repo', 'bond_borrow', 'rev_repo', 'bond_lend'],
+        ColumnNames.TRADE_TYPE: ['repo', 'bond_borrow', 'rev_repo', 'bond_lend'],
+        ColumnNames.NOTIONAL: [1000000, 500000, 750000, 1200000],
+        ColumnNames.PRICE: [1.02, 0.98, 1.01, 0.99],
+        ColumnNames.START_CASH: [1020000, 0, 757500, 0],
+        ColumnNames.MARKET_PRICE: [1.025, 0.975, 1.015, 0.985],
+        ColumnNames.CCY: ['USD', 'EUR', 'GBP', 'EUR'],
+        ColumnNames.BOND_CURRENCY: ['EUR', 'USD', 'EUR', 'GBP']
+    }
+    
+    # Create sample DataFrame
+    df = pd.DataFrame(sample_data)
+    
+    # Validate input
+    validate_input_data(df)
+    
+    # Calculate EUR directional market value
+    result = calculate_eur_directional_mv(df)
+    
+    # Display results
+    print("Input Data:")
+    print(df)
+    print("\nCalculated Results:")
+    print(result[[
+        ColumnNames.PRODUCT_TYPE,
+        ColumnNames.IS_CASH_BASED,
+        ColumnNames.CASH_CCY,
+        ColumnNames.SEC_CCY,
+        ColumnNames.TRADE_DIRECTION,
+        ColumnNames.MV_CASH,
+        ColumnNames.MV_SEC,
+        ColumnNames.EUR_MV_CASH,
+        ColumnNames.EUR_MV_SEC,
+        ColumnNames.EUR_DIRECTIONAL_MV
+    ]])
